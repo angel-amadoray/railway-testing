@@ -1,0 +1,11 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+.venv
+venv
+.env
+data/sample_fits/**/*.fits
+tests/
+scripts/
+*.md

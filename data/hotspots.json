@@ -1,0 +1,32 @@
+[
+  {
+    "id": "southern_field_1",
+    "name": "Campo Austral A (test)",
+    "description": "Campo de prueba austral con FITS real de SPHEREx. Será reemplazado cuando haya datos de Orión.",
+    "ra": 349.78099,
+    "dec": -56.49399,
+    "size_deg": 1.0,
+    "epochs": ["2025-04", "2025-09"],
+    "thumbnail_url": null
+  },
+  {
+    "id": "southern_field_2",
+    "name": "Campo Austral B (test)",
+    "description": "Segundo campo de prueba austral. Placeholder.",
+    "ra": 349.78099,
+    "dec": -56.49399,
+    "size_deg": 1.0,
+    "epochs": ["2025-04", "2025-09"],
+    "thumbnail_url": null
+  },
+  {
+    "id": "southern_field_3",
+    "name": "Campo Austral C (test)",
+    "description": "Tercer campo de prueba austral. Placeholder.",
+    "ra": 349.78099,
+    "dec": -56.49399,
+    "size_deg": 1.0,
+    "epochs": ["2025-04", "2025-09"],
+    "thumbnail_url": null
+  }
+]
