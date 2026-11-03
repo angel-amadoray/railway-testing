@@ -45,24 +45,24 @@ def _parse_dec_deg(dec_str: str | None) -> float | None:
 @router.get("/difference", response_model=DifferenceResponse)
 def difference(
     request: Request,
-    sector_id: str,
-    epoch_from: str,
-    epoch_to: str,
-    detector: int = Query(1, ge=1, le=6),
+    sector_id: str, # id del sector del cielo a observar
+    epoch_from: str, # temporada de visualización desde
+    epoch_to: str, # temporada de visualización hasta
+    detector: int = Query(1, ge=1, le=6),  # SPHEREx tiene 6 detectores, values 1-6
     # --- Background ---
-    background_mode: str = Query("row", pattern="^(row|2d|none)$"),
-    background_downsample: int = Query(8, ge=2, le=32),
+    background_mode: str = Query("row", pattern="^(row|2d|none)$"), # eliminacion de ruido de fondo, per_row recomendado
+    background_downsample: int = Query(8, ge=2, le=32), # reduccion de tamaño de imagen, values 2-32, 2 para la mejor calidad
     # --- Diferencia ---
-    ratio: bool = Query(False),
+    ratio: bool = Query(False), # False-resta las imagenes, true-divide las imagenes
     # --- Máscaras de estrellas ---
     mask_stars_for_threshold: bool = Query(True),
     mask_stars_for_display: bool = Query(False),
     star_percentile: float = Query(99.9, ge=90.0, le=99.999),
     # --- Normalización ---
-    normalize: str = Query("absolute", pattern="^(absolute|snr)$"),
-    noise_block_size: int = Query(64, ge=16, le=256),
+    normalize: str = Query("absolute", pattern="^(absolute|snr)$"), # absolute-diferencia cruda, snr(signal to noise ratio)-divide por el ruido estimado
+    noise_block_size: int = Query(64, ge=16, le=256), # tamaño del bloque del ruido local
     # --- Threshold ---
-    threshold_method: str = Query("percentile", pattern="^(percentile|sigma|absolute)$"),
+    threshold_method: str = Query("percentile", pattern="^(percentile|sigma|absolute)$"), # percentile-utiliza porcentaje, sigma-utiliza desvest, absolute-valor fijo
     threshold_value: float | None = Query(None, gt=0),
     threshold_percentile: float = Query(99.0, ge=50.0, le=99.99),
     sigma_k: float = Query(5.0, gt=0, le=20),
@@ -217,15 +217,15 @@ def known_objects(
     sector_id: str,
     epoch: str,
     detector: int = Query(1, ge=1, le=6),
-    radius_deg: float = Query(0.5, gt=0, le=5.0),
-    obs_time_iso: str | None = None,
-    two_pass: bool = Query(False),
+    radius_deg: float = Query(0.5, gt=0, le=5.0), # radio alrededor del centro de la imagen donde buscar
+    obs_time_iso: str | None = None, # fecha de observacion
+    two_pass: bool = Query(False), # false-busqueda aproximada, true-refinada
     mag_required: bool = Query(False),
-    max_vmag: float | None = Query(20.0),
-    max_objects: int | None = Query(200, ge=1, le=5000),
+    max_vmag: float | None = Query(20.0), # visual magnitude, brillo maximo permitido, valores bajos brillantes, valores altos distrantes
+    max_objects: int | None = Query(200, ge=1, le=5000), # maximo de objetos reconocidos
     sort_by: str = Query("vmag", pattern="^(vmag|offset|name)$"),
-    offset_margin: float = Query(1.4142, gt=1.0, le=3.0),
-    include_pixels: bool = Query(True),
+    offset_margin: float = Query(1.4142, gt=1.0, le=3.0), # margen de objetos dentro del campo de vision
+    include_pixels: bool = Query(True), # calcula coordenadas x,y para aparecer cada objeto
     ra_override_deg: float | None = Query(None, ge=0, le=360),
     dec_override_deg: float | None = Query(None, ge=-90, le=90),
     obs_id: str | None = None,
@@ -445,8 +445,8 @@ def identify(
     detector: int = Query(1, ge=1, le=6),
     pixel_x: int = Query(..., ge=0),
     pixel_y: int = Query(..., ge=0),
-    tolerance_arcsec: float = Query(15.0, gt=0, le=120.0),
-    max_vmag: float | None = Query(22.0),
+    tolerance_arcsec: float = Query(15.0, gt=0, le=120.0), # radio de busqueda alrededor del pixel clickeado
+    max_vmag: float | None = Query(22.0), # filtra por brillo
     obs_id: str | None = None,
     visit: int | None = None,
 ):

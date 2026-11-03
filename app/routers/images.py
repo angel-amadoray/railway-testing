@@ -13,18 +13,18 @@ router = APIRouter(prefix="/images", tags=["images"])
 @router.get("/composite", response_model=CompositeResponse)
 def composite(
     request: Request,
-    sector_id: str,
-    epoch: str,
-    detector: int = Query(1, ge=1, le=6),
-    stretch_scale: float = Query(10.0, gt=0, le=100),
-    p_low: float = Query(1.0, ge=0.0, lt=50.0),
-    p_high: float = Query(99.5, gt=50.0, le=100.0),
-    quality: int = Query(85, ge=10, le=100),
-    downsample: int = Query(8, ge=1, le=32),
-    mode: str = Query("per_row", pattern="^(global|per_row)$"),
-    fill_masked: bool = Query(True),
-    obs_id: str | None = None,
-    visit: int | None = None,
+    sector_id: str, # id del sector del cielo a observar
+    epoch: str, # temporada de visualización
+    detector: int = Query(1, ge=1, le=6), # SPHEREx tiene 6 detectores, values 1-6
+    stretch_scale: float = Query(10.0, gt=0, le=100), # contraste de la imagen, values 0-100, 0-menos contraste, 100-mas contraste
+    p_low: float = Query(1.0, ge=0.0, lt=50.0), # rango de brillo, values 1.0-99.5, elimina ruido de fondo, pierde objetos debiles
+    p_high: float = Query(99.5, gt=50.0, le=100.0), # rango de brillo, values 1.0-99.5, evita saturacion de estrellas brillantes
+    quality: int = Query(85, ge=10, le=100), # calidad de compresion del WEBP, values 10-100
+    downsample: int = Query(8, ge=1, le=32), # reduccion de tamaño de imagen, values 1-32, 1 para la mejor calidad
+    mode: str = Query("per_row", pattern="^(global|per_row)$"), # per_row normaliza cada longitud de onda independientemente, ver todas las longitudes de onda simultaneamente
+    fill_masked: bool = Query(True), # filtra pixeles muertos
+    obs_id: str | None = None, # observaciones especificas dentro de sector/epoca
+    visit: int | None = None, # observaciones especificas dentro de sector/epoca
 ):
     hotspot = request.app.state.hotspots.get(sector_id)
     if hotspot is None:
@@ -45,8 +45,8 @@ def composite(
         "p_high": p_high,
         "quality": quality,
         "downsample": downsample,
-        "mode": mode,                 # ← nuevo
-        "fill_masked": fill_masked,   # ← nuevo
+        "mode": mode,
+        "fill_masked": fill_masked,
     }
     if obs_id:
         params["obs_id"] = obs_id
