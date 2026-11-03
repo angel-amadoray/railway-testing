@@ -4,10 +4,12 @@ import logging
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.core import cache
-from app.models.analytics import DifferenceResponse, KnownObject, KnownObjectsResponse, IdentifyResponse
+from app.models.analytics import DifferenceResponse, KnownObject, KnownObjectsResponse, IdentifyResponse, SpectrumResponse, SpherexProfile
 from app.services import diff_engine as de
 from app.services import fits_loader as fl
 from app.services import jpl_api
+from app.services import spectral_analyzer as sa
+
 
 from astropy.coordinates import SkyCoord
 import astropy.units as u
@@ -447,6 +449,7 @@ def identify(
     pixel_y: int = Query(..., ge=0),
     tolerance_arcsec: float = Query(15.0, gt=0, le=120.0), # radio de busqueda alrededor del pixel clickeado
     max_vmag: float | None = Query(22.0), # filtra por brillo
+    include_profile: bool = Query(True),
     obs_id: str | None = None,
     visit: int | None = None,
 ):
@@ -571,6 +574,29 @@ def identify(
             )
         )
 
+    # 5.b) Analizar el micro-espectro del píxel si se pidió
+    profile_data = None
+    if include_profile:
+        try:
+            hdul_prof = fl.load_local_fits(
+                sector_id=sector_id, epoch=epoch, detector=detector,
+                obs_id=obs_id, visit=visit,
+            )
+            try:
+                profile_data = sa.analyze_pixel(
+                    hdul_prof,
+                    pixel_x,
+                    pixel_y,
+                    known_objects=[
+                        {"name": o.name, "vmag": o.vmag}
+                        for o in known
+                    ],
+                )
+            finally:
+                hdul_prof.close()
+        except Exception as e:
+            logger.warning("spectral profile failed: %s", e)
+
     response = IdentifyResponse(
         sector_id=sector_id,
         epoch=epoch,
@@ -584,6 +610,7 @@ def identify(
         known_objects=known,
         is_known=len(known) > 0,
         is_candidate=len(known) == 0,
+        spherex_profile=SpherexProfile(**profile_data) if profile_data else None,
         cached=False,
     )
 
@@ -592,3 +619,59 @@ def identify(
     cache.put("identify", params, json.dumps(data, indent=2).encode("utf-8"))
 
     return response
+
+
+@router.get("/spectrum", response_model=SpectrumResponse)
+def spectrum(
+    request: Request,
+    sector_id: str,
+    epoch: str,
+    detector: int = Query(1, ge=1, le=6),
+    pixel_x: int = Query(..., ge=0),
+    pixel_y: int = Query(..., ge=0),
+    obs_id: str | None = None,
+    visit: int | None = None,
+):
+    """
+    Extrae el micro-espectro local de un píxel (cutout 100×100) y devuelve
+    el perfil espectral interpretado.
+    """
+    hotspot = request.app.state.hotspots.get(sector_id)
+    if hotspot is None:
+        raise HTTPException(404, f"Sector '{sector_id}' not found")
+    if epoch not in hotspot.epochs:
+        raise HTTPException(400, f"Epoch '{epoch}' not available")
+
+    try:
+        hdul = fl.load_local_fits(
+            sector_id=sector_id, epoch=epoch, detector=detector,
+            obs_id=obs_id, visit=visit,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(404, f"No FITS found: {e}")
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+
+    try:
+        ny, nx = hdul["IMAGE"].data.shape
+        if not (0 <= pixel_x < nx and 0 <= pixel_y < ny):
+            raise HTTPException(400, f"Pixel fuera de imagen {nx}×{ny}")
+
+        result = sa.analyze_pixel(hdul, pixel_x, pixel_y)
+        spectrum_data = sa.extract_local_spectrum(hdul, pixel_x, pixel_y)
+    finally:
+        hdul.close()
+
+    return SpectrumResponse(
+        sector_id=sector_id,
+        epoch=epoch,
+        detector=detector,
+        pixel_x=pixel_x,
+        pixel_y=pixel_y,
+        wavelengths_um=spectrum_data["wavelengths_um"],
+        flux_per_row=spectrum_data["flux_per_row"],
+        wavelength_range_um=list(spectrum_data["wavelength_range_um"]),
+        total_flux=spectrum_data["total_flux"],
+        valid_fraction=spectrum_data["valid_fraction"],
+        profile=SpherexProfile(**result),
+    )

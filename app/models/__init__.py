@@ -15,5 +15,6 @@ __all__ = [
     "Hotspot", "HotspotsCatalog",
     "CompositeResponse",
     "DifferenceResponse", "KnownObject", "KnownObjectsResponse", "IdentifyResponse",
-    "AstrometryResponse", "AstrometryWCS"
+    "AstrometryResponse", "AstrometryWCS",
+    "SpectrumResponse", "SpherexProfile", "VisualHints"
 ]

@@ -1,4 +1,42 @@
 from pydantic import BaseModel
+from typing import Literal
+
+# for spectral analyzer
+class VisualHints(BaseModel):
+    base_color_hex: str
+    roughness: float
+    metalness: float
+    emissive_intensity: float
+    scale_hint: Literal["small", "medium", "large"]
+    suggested_3d_model: Literal["rocky", "star", "unknown"]
+
+
+class SpherexProfile(BaseModel):
+    classification: str  # STAR | ASTEROID | UNKNOWN
+    temperature_k: float | None = None
+    dominant_composition: str | None = None
+    spectral_slope: float
+    color_index: float
+    wavelength_range_um: list[float]
+    total_flux: float
+    valid_fraction: float
+    visual_hints: VisualHints
+
+
+class SpectrumResponse(BaseModel):
+    sector_id: str
+    epoch: str
+    detector: int
+    pixel_x: int
+    pixel_y: int
+    wavelengths_um: list[float]
+    flux_per_row: list[float]
+    wavelength_range_um: list[float]
+    total_flux: float
+    valid_fraction: float
+    profile: SpherexProfile
+
+# for jpl integration
 
 class KnownObject(BaseModel):
     name: str
@@ -29,7 +67,7 @@ class KnownObjectsResponse(BaseModel):
     n_objects_raw: int
     n_objects_after_offset: int
     n_objects_after_vmag: int
-    n_objects: int                    # lo que se devuelve
+    n_objects: int
     filtered_out_offset: int
     filtered_out_vmag: int
     truncated: int
@@ -65,4 +103,5 @@ class IdentifyResponse(BaseModel):
     known_objects: list[KnownObject]
     is_known: bool
     is_candidate: bool
+    spherex_profile: SpherexProfile | None = None
     cached: bool
