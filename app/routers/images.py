@@ -5,7 +5,9 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from app.core import cache
 from app.models.image import CompositeResponse
 from app.services import color_engine as ce
-from app.services import fits_loader as fl
+from app.services import storage, fits_loader as fl
+
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/images", tags=["images"])
@@ -90,3 +92,35 @@ def composite(
     path = cache.put("composite", params, buf)
 
     return CompositeResponse(url=cache.url_for(path), cached=False, parameters=params)
+
+@router.get("/available-detectors")
+def get_available_detectors(sector_id: str, epoch: str):
+    """
+    Devuelve la lista de detectores (1-6) que existen en local o en OCI
+    para un sector y época dados.
+    """
+    available = set()
+
+    # 1. Buscar en local
+    local_files = fl.find_sector_files(sector_id, epoch)
+    for f in local_files:
+        meta = fl.parse_filename_metadata(f.name)
+        if meta and "detector" in meta:
+            available.add(meta["detector"])
+
+    # 2. Buscar en OCI (si está habilitado)
+    if settings.oci_download_enabled:
+        try:
+            remote_files = storage.list_remote_files(sector_id, epoch)
+            for f in remote_files:
+                meta = fl.parse_filename_metadata(f["filename"])
+                if meta and "detector" in meta:
+                    available.add(meta["detector"])
+        except Exception as e:
+            logger.warning(f"Error listando detectores en OCI para {sector_id}/{epoch}: {e}")
+
+    return {
+        "sector_id": sector_id,
+        "epoch": epoch,
+        "detectors": sorted(list(available))
+    }
