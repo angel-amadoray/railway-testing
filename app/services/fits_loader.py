@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 from astropy.io import fits
 from astropy.wcs import WCS
+import astropy.units as u
 from scipy.ndimage import zoom
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,26 @@ logger = logging.getLogger(__name__)
 FILENAME_PATTERN = re.compile(
     r"level2_(?P<planning_period>.+?)_(?P<obs_id>\d+)_(?P<visit>\d+)D(?P<detector>\d+)"
     r"_spx_l2b-v(?P<version>\d+)-(?P<processing_date>\d{4}-\d{3})\.fits$"
+)
+
+# Validación defensiva para evitar path traversal en sector_id/epoch
+_ID_RE = re.compile(r"^[a-z0-9_\-]+$")
+
+# Bits de FLAGS considerados "no confiables" según SPHEREx Explanatory Supplement.
+# Otros bits son informativos (ej: pixel corregido, fuera de rango pero válido).
+BAD_BITS = (
+    (1 << 0)   # bad data / no signal
+    | (1 << 1)   # saturated
+    | (1 << 2)   # cosmic ray hit
+    | (1 << 6)   # dead pixel
+    | (1 << 7)   # hot pixel
+    | (1 << 9)   # high noise
+    | (1 << 10)  # calibration issue
+    | (1 << 11)  # non-linear response
+    | (1 << 14)  # source extraction failed
+    | (1 << 15)  # invalid flux
+    | (1 << 17)  # zodiacal subtraction failed
+    | (1 << 19)  # overflow
 )
 
 RA_KEYS = ("RA_TARG", "RA_OBJ", "RA_CEN", "CRVAL1", "OBJ_RA")
@@ -69,6 +90,14 @@ def _get_ext(hdul: fits.HDUList, name: str) -> fits.hdu.base.ExtensionHDU:
             f"Extension '{name}' not found in FITS. Available: {available}"
         )
 
+def _validate_id(name: str, kind: str) -> str:
+    if not _ID_RE.match(name or ""):
+        raise ValueError(
+            f"Invalid {kind}: {name!r}. "
+            f"Only lowercase letters, digits, '_' and '-' are allowed."
+        )
+    return name
+
 
 # --------------------------------------------------------------------------- #
 # WCS: espacial y espectral
@@ -103,8 +132,13 @@ def detector_for_wavelength(wavelength_um: float) -> int | None:
 # Mapa de λ (2D)
 # --------------------------------------------------------------------------- #
 
-def _quantity_to_array(q) -> np.ndarray:
-    """Convierte Quantity de astropy a ndarray float32 (usa .value si existe)."""
+def _quantity_to_array(q, target_unit=u.um) -> np.ndarray:
+    """
+    Convierte Quantity de astropy a ndarray float32 en la unidad `target_unit`.
+    Si `q` no tiene unidades, se asume que ya está en `target_unit`.
+    """
+    if hasattr(q, "to"):
+        q = q.to(target_unit)
     if hasattr(q, "value"):
         q = q.value
     return np.asarray(q, dtype=np.float32)
@@ -156,9 +190,13 @@ def get_wavelength_map(hdul: fits.HDUList, downsample: int = 4) -> np.ndarray:
 # Imagen limpia (IMAGE - ZODI, con FLAGS enmascarados)
 # --------------------------------------------------------------------------- #
 
-def get_clean_image(hdul: fits.HDUList, subtract_zodi: bool = True) -> np.ndarray:
+def get_clean_image(hdul: fits.HDUList, subtract_zodi: bool = True, bad_bits: int = BAD_BITS) -> np.ndarray:
     """
     Devuelve IMAGE - ZODI con píxeles flaggeados puestos a 0.
+
+    Solo se enmascaran los FLAGS bits en `bad_bits` (default: los críticos).
+    Otros bits (correcciones menores) se ignoran para preservar más datos.
+
     Salida: float32 (H, W).
     """
     image_hdu = _get_ext(hdul, "IMAGE")
@@ -177,7 +215,7 @@ def get_clean_image(hdul: fits.HDUList, subtract_zodi: bool = True) -> np.ndarra
     try:
         flags = _get_ext(hdul, "FLAGS").data
         if flags is not None:
-            bad = flags != 0
+            bad = (flags & bad_bits) != 0
             image[bad] = np.nan
     except KeyError:
         logger.warning("FLAGS extension missing; not masking bad pixels")
@@ -201,7 +239,8 @@ def extract_2d_at_wavelength(
     [target_um - tol_um, target_um + tol_um] conservan su flujo.
     El resto se pone a 0.
 
-    Para SPHEREx (LVF), esto produce una "franja vertical" de ~constante X.
+    Para SPHEREx (LVF), esto produce una 'franja horizontal' de ~constante Y
+    (el eje espectral principal de SPHEREx va a lo largo de Y
     """
     clean = get_clean_image(hdul)
     wave_map = get_wavelength_map(hdul, downsample=downsample)
@@ -302,6 +341,9 @@ def parse_filename_metadata(filename: str) -> dict:
 
 def find_sector_files(sector_id: str, epoch: str, data_dir: Path | None = None) -> list[Path]:
     """Lista los .fits en data/sample_fits/{sector}/{epoch}/."""
+    _validate_id(sector_id, "sector_id")
+    _validate_id(epoch, "epoch")
+
     if data_dir is None:
         from app.config import settings
         data_dir = Path(settings.data_dir)
@@ -326,6 +368,9 @@ def find_fits_file(
     Lanza FileNotFoundError si no hay match; ValueError si hay más de uno
     y no se especificó obs_id/visit.
     """
+    _validate_id(sector_id, "sector_id")
+    _validate_id(epoch, "epoch")
+
     files = find_sector_files(sector_id, epoch, data_dir)
     matches: list[Path] = []
     for f in files:
@@ -364,19 +409,27 @@ def load_local_fits(
     data_dir: Path | None = None,
 ) -> fits.HDUList:
     """
-    Abre el FITS correspondiente. Si no existe localmente, intenta descargarlo
-    desde OCI (ver app.services.storage). Caller debe cerrar el HDUList.
+    Abre el FITS correspondiente.
+
+    - Si `data_dir` se especifica → solo busca localmente (sin OCI).
+    - Si es None → busca local y, si falta, descarga de OCI.
+
+    Caller debe cerrar el HDUList.
     """
-    # Import local para evitar ciclo: storage importa fits_loader
     from app.services.storage import download_fits_if_missing
 
-    path = download_fits_if_missing(
-        sector_id=sector_id,
-        epoch=epoch,
-        detector=detector,
-        obs_id=obs_id,
-        visit=visit,
-    )
+    if data_dir is not None:
+        path = find_fits_file(
+            sector_id, epoch, detector, obs_id, visit, data_dir
+        )
+    else:
+        path = download_fits_if_missing(
+            sector_id=sector_id,
+            epoch=epoch,
+            detector=detector,
+            obs_id=obs_id,
+            visit=visit,
+        )
     logger.info("Loading FITS: %s", path)
     return open_mef(path)
 

@@ -23,7 +23,11 @@ from astropy.io import fits
 from PIL import Image
 from scipy.ndimage import median_filter
 
-from app.services.fits_loader import get_clean_image, get_wavelength_map
+from app.services.fits_loader import (
+    DETECTOR_WAVELENGTH_RANGES,
+    get_clean_image,
+    get_wavelength_map
+)
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +166,11 @@ def spectral_paint(
         raise ValueError(f"Unknown mode: {mode!r}. Use 'per_row' or 'global'.")
 
     brightness = arcsinh_stretch(brightness, scale=stretch_scale)
+    # Inferir rango λ del detector si no se especificó (consistencia entre épocas)
+    if wave_min is None or wave_max is None:
+        det = int(hdul["IMAGE"].header.get("DETECTOR", 0))
+        if det in DETECTOR_WAVELENGTH_RANGES:
+            wave_min, wave_max = DETECTOR_WAVELENGTH_RANGES[det]
     color = wavelength_colormap(wave, wave_min=wave_min, wave_max=wave_max)
 
     rgb = color * brightness[..., np.newaxis]
