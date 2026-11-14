@@ -27,10 +27,21 @@ RETRY_DELAY_S = 2.0
 
 
 class JPLAPIError(Exception):
-    """Error de comunicación o parseo con la API de JPL."""
+    """Error específico de comunicación, respuesta o parseo de la API de JPL."""
 
 
 def _deg_to_hms(ra_deg: float) -> str:
+    """Convierte ascensión recta decimal al formato horario que requiere JPL.
+
+    La ascensión recta se interpreta en grados y se divide entre 15 para
+    obtener horas. El resultado usa ``HH-MM-SS.ss``.
+
+    Args:
+        ra_deg: Ascensión recta en grados.
+
+    Returns:
+        Cadena con horas, minutos y segundos separada por guiones.
+    """
     hours = ra_deg / 15.0
     h = int(hours)
     m = int((hours - h) * 60)
@@ -39,6 +50,15 @@ def _deg_to_hms(ra_deg: float) -> str:
 
 
 def _deg_to_dms(dec_deg: float) -> str:
+    """Convierte declinación decimal al formato sexagesimal de JPL.
+
+    Args:
+        dec_deg: Declinación en grados; los valores negativos conservan su signo.
+
+    Returns:
+        Cadena ``DD-MM-SS.ss``; para valores negativos usa el prefijo ``M``
+        esperado por el formato de la API.
+    """
     sign = "M" if dec_deg < 0 else ""
     dec_abs = abs(dec_deg)
     d = int(dec_abs)
@@ -48,11 +68,33 @@ def _deg_to_dms(dec_deg: float) -> str:
 
 
 def _parse_rows(fields: list[str], rows: list[list]) -> list[dict]:
+    """Transforma filas tabulares de JPL en una lista de diccionarios.
+
+    Cada elemento de ``fields`` se empareja con el valor de la misma posición
+    en cada fila mediante ``zip``.
+
+    Args:
+        fields: Nombres de columnas devueltos por JPL.
+        rows: Filas de datos en el orden de esas columnas.
+
+    Returns:
+        Una lista donde cada fila se representa como ``dict``.
+    """
     return [dict(zip(fields, row)) for row in rows]
 
 
 def _safe_float(value) -> float | None:
-    """Convierte 'n.a.', '', '3.E5', '-2.E5' a float. Devuelve None si no es posible."""
+    """Convierte de forma tolerante un valor de JPL a ``float``.
+
+    Acepta números y cadenas científicas, y trata marcadores como ``n.a.``,
+    ``nan``, ``--`` o la cadena vacía como datos ausentes.
+
+    Args:
+        value: Valor recibido desde la respuesta de JPL.
+
+    Returns:
+        Número flotante o ``None`` si el valor está ausente o no es convertible.
+    """
     if value is None:
         return None
     s = str(value).strip()
@@ -65,7 +107,24 @@ def _safe_float(value) -> float | None:
 
 
 def _request_with_retry(params: dict, timeout: int, retries: int) -> dict:
-    """GET con reintentos para errores transitorios (5xx, timeouts)."""
+    """Realiza la petición GET a JPL con reintentos controlados.
+
+    Reintenta respuestas HTTP 5xx y timeouts hasta ``retries`` veces,
+    esperando ``RETRY_DELAY_S`` entre intentos. Las respuestas no exitosas
+    permanentes, errores de red y cuerpos que no sean JSON se convierten en
+    ``JPLAPIError``.
+
+    Args:
+        params: Parámetros de consulta enviados a la API.
+        timeout: Tiempo máximo de espera por petición, en segundos.
+        retries: Número de reintentos adicionales después del primer intento.
+
+    Returns:
+        Diccionario decodificado desde el JSON de la respuesta.
+
+    Raises:
+        JPLAPIError: Si la API falla, agota los reintentos o devuelve JSON inválido.
+    """
     last_err = None
     for attempt in range(1, retries + 2):  # intentos = retries + 1
         try:
@@ -113,19 +172,44 @@ def find_known_objects(
     sort_by: str = "vmag",                  # "vmag" | "offset" | "name"
 ) -> dict:
     """
-    Devuelve los asteroides conocidos dentro del FOV en el instante dado.
+    Consulta JPL y devuelve objetos menores conocidos dentro de un campo de visión.
 
-    Filtros aplicados (en orden):
+    Construye la consulta con centro, radio, instante y observador; selecciona
+    los resultados de la pasada de JPL disponible y los convierte a diccionarios.
+    Después aplica filtros locales de distancia y magnitud, ordena y limita la
+    cantidad final de objetos.
+
+    Args:
+        ra_center_deg: Ascensión recta del centro del FOV, en grados.
+        dec_center_deg: Declinación del centro del FOV, en grados.
+        radius_deg: Semiancho del FOV en grados para RA y Dec.
+        obs_time_iso: Instante de observación en ISO; se adapta al formato JPL.
+        observer: Observatorio como ``xobs``, ``mpc_code`` o ``lat``/``lon`` y
+            opcionalmente ``alt``.
+        two_pass: Solicita el modo de dos pasadas de JPL.
+        mag_required: Pide a JPL exigir magnitud visual.
+        sb_kind: Tipo de objeto menor solicitado por JPL.
+        timeout: Timeout de cada petición HTTP, en segundos.
+        retries: Reintentos para fallos transitorios.
+        filter_by_offset: Activa el filtro local de distancia al centro.
+        offset_margin: Multiplicador del radio para cubrir la diagonal del FOV.
+        max_vmag: Magnitud visual máxima; ``None`` desactiva el filtro.
+        max_objects: Máximo de objetos devueltos; ``None`` no limita.
+        sort_by: Orden: ``vmag``, ``offset`` o ``name``.
+
+    Filtros locales aplicados (en orden):
         1. Descarta objetos con |offset| > radius_deg * 3600 * offset_margin
         2. Descarta objetos con V > max_vmag (si max_vmag no es None)
         3. Ordena por sort_by ("vmag" ascendente, "offset" ascendente, "name")
         4. Trunca a max_objects (si max_objects no es None)
 
-    Reporta:
-        n_objects_raw         → lo que JPL devolvió
-        n_objects_after_offset → tras filtrar por offset
-        n_objects_after_vmag  → tras filtrar por magnitud
-        n_objects             → tras truncar (lo que finalmente se devuelve)
+    Returns:
+        Diccionario con los objetos finales, campos, resumen de JPL, observador,
+        modo de pasada, conteos brutos y conteos después de cada filtro.
+
+    Raises:
+        JPLAPIError: Si falta el observador, es inválido, la API devuelve un
+            error o ``sort_by`` no es compatible.
     """
     if not observer:
         raise JPLAPIError(
@@ -252,11 +336,13 @@ def find_known_objects(
     # PASO 3: ordenar
     if sort_by == "vmag":
         def key_v(o):
+            """Devuelve la clave de ordenación por magnitud visual."""
             v = _safe_float(o.get("Visual magnitude (V)"))
             return (v is None, v if v is not None else 999.0)
         objects.sort(key=key_v)
     elif sort_by == "offset":
         def key_o(o):
+            """Devuelve la clave de ordenación por distancia al centro."""
             x = _safe_float(o.get('Dist. from center Norm (")'))
             return (x is None, abs(x) if x is not None else 1e18)
         objects.sort(key=key_o)

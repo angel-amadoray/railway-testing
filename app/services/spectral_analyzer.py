@@ -50,6 +50,26 @@ MIN_WAVELENGTH_RANGE_NM = 3.0
 # --------------------------------------------------------------------------- #
 
 def _extract_cutout(hdul: fits.HDUList, pixel_x: int, pixel_y: int) -> dict:
+    """Extrae el recorte de análisis alrededor de un píxel seleccionado.
+
+    Carga la imagen limpia, el mapa de longitudes de onda y la varianza, y los
+    recorta al área ``CUTOUT_SIZE`` centrada en la posición indicada. Ajusta el
+    recorte cuando está cerca del borde y registra si toca el límite del
+    detector.
+
+    Args:
+        hdul: Archivo FITS abierto de un detector SPHEREx.
+        pixel_x: Coordenada X del píxel seleccionado.
+        pixel_y: Coordenada Y del píxel seleccionado.
+
+    Returns:
+        Diccionario con ``clean``, ``wave``, ``var``, centro local, forma y
+        bandera de borde.
+
+    Raises:
+        ValueError: Si el recorte resultante es demasiado pequeño para la
+            apertura fotométrica.
+    """
     clean = get_clean_image(hdul, subtract_zodi=True)
     wave = get_wavelength_map(hdul, downsample=4)
     var = get_variance(hdul)
@@ -83,6 +103,20 @@ def _extract_cutout(hdul: fits.HDUList, pixel_x: int, pixel_y: int) -> dict:
 # --------------------------------------------------------------------------- #
 
 def _aperture_photometry(cut: dict) -> dict:
+    """Calcula fotometría de apertura y relación señal/ruido.
+
+    Suma el flujo dentro de una apertura circular, estima el fondo con un
+    anillo concéntrico y lo sustrae. El error se obtiene de ``VARIANCE`` cuando
+    existe; si no, se estima con la desviación del anillo.
+
+    Args:
+        cut: Diccionario producido por ``_extract_cutout``.
+
+    Returns:
+        Diccionario con flujo, error, SNR y fracciones válidas de apertura y
+        anillo. Si hay menos de tres píxeles válidos en la apertura, las
+        medidas fotométricas se devuelven como ``None``.
+    """
     clean = cut["clean"]
     var = cut["var"]
     cy, cx = cut["center_y"], cut["center_x"]
@@ -130,11 +164,19 @@ def _aperture_photometry(cut: dict) -> dict:
 
 def _spectral_cutout(cut: dict) -> dict:
     """
-    Para CADA fila del cutout, mide el flujo en una apertura horizontal de
-    ±APERTURE_RADIUS centrada en X del click. Captura el eje espectral completo
-    del cutout, no solo la apertura centrada.
+    Construye un micro-espectro recorriendo todas las filas del recorte.
 
-    Solo conserva filas donde hay señal significativa (flujo > 3σ_bkg).
+    En cada fila mide la media del flujo en una apertura horizontal centrada en
+    X del clic. Calcula la longitud de onda media y, si existe, el error a partir
+    de ``VARIANCE``. Omite filas con menos de dos píxeles válidos y ordena los
+    puntos finales por longitud de onda.
+
+    Args:
+        cut: Diccionario producido por ``_extract_cutout``.
+
+    Returns:
+        Diccionario con listas ordenadas de ``wavelengths``, ``fluxes`` y
+        ``flux_errs``. Si no hay filas válidas, las tres listas quedan vacías.
     """
     clean = cut["clean"]
     wave = cut["wave"]
@@ -194,12 +236,22 @@ def _compute_color_ratio(
     n_extreme: int = 3,
 ) -> dict:
     """
-    color_ratio = median(F_long) / median(F_short)
+    Calcula el índice de color como ``median(F_long) / median(F_short)``.
 
-    F_short: mediana del flujo en las `n_extreme` filas con menor λ.
-    F_long:  mediana del flujo en las `n_extreme` filas con mayor λ.
+    ``F_short`` usa las filas con menor longitud de onda y ``F_long`` las de
+    mayor longitud de onda. También propaga los errores medianos, informa el
+    rango espectral en nanómetros y conserva el número de puntos disponibles.
 
-    Devuelve ratio, error propagado, rango λ en nm y flag reliable.
+    Args:
+        wavelengths: Longitudes de onda de los puntos del micro-espectro, en μm.
+        fluxes: Flujos correspondientes a cada longitud de onda.
+        flux_errs: Errores de flujo correspondientes.
+        n_extreme: Cantidad de puntos extremos usados por cada lado.
+
+    Returns:
+        Diccionario con ratio, error, flujos corto/largo, rango en nm y número
+        de puntos. El ratio es ``None`` si faltan puntos o el flujo corto no es
+        positivo.
     """
     if len(wavelengths) < 2 * n_extreme:
         return {
@@ -262,6 +314,22 @@ def _classify_color(
     snr: float | None,
     reliable: bool,
 ) -> tuple[str, float, list[str]]:
+    """Clasifica estadísticamente el candidato usando color y calidad de señal.
+
+    Rechaza resultados con rango espectral insuficiente, SNR bajo o datos
+    incompletos. Para resultados válidos compara la desviación del ratio
+    respecto a 1 con ``ratio_err`` y devuelve ``STAR_LIKE`` para color azul o
+    ``ROCKY_LIKE`` para color rojo.
+
+    Args:
+        ratio: Ratio de flujo largo/corto.
+        ratio_err: Error estimado del ratio.
+        snr: Relación señal/ruido fotométrica.
+        reliable: Indica si el rango espectral mínimo está cubierto.
+
+    Returns:
+        Tupla con clase, confianza entre 0 y 1 y lista de razones.
+    """
     if not reliable:
         return "UNKNOWN", 0.0, ["wavelength_range_too_small"]
     if snr is None or snr < MIN_SNR:
@@ -291,6 +359,20 @@ def _classify_color(
 # --------------------------------------------------------------------------- #
 
 def _visual_hints(cls: str, ratio: float | None, confidence: float) -> dict:
+    """Genera parámetros visuales orientativos para representar el candidato.
+
+    Elige un color base según el ratio y reduce la confianza visual cuando la
+    evidencia es débil. Después asigna rugosidad, metalicidad, emisión, escala
+    y modelo sugerido según la clase estadística.
+
+    Args:
+        cls: Clase ``STAR_LIKE``, ``ROCKY_LIKE`` o ``UNKNOWN``.
+        ratio: Ratio de color, si está disponible.
+        confidence: Confianza de la clasificación.
+
+    Returns:
+        Diccionario de sugerencias de material y modelo 3D.
+    """
     if ratio is None or confidence < 0.2:
         base_color = "#c8c8c8"
     elif ratio < 0.7:
@@ -322,6 +404,21 @@ def _visual_hints(cls: str, ratio: float | None, confidence: float) -> dict:
 # --------------------------------------------------------------------------- #
 
 def analyze_pixel(hdul: fits.HDUList, pixel_x: int, pixel_y: int) -> dict:
+    """Ejecuta el análisis fotométrico y espectral completo de un píxel.
+
+    Combina recorte, fotometría de apertura, micro-espectro, ratio de color,
+    clasificación estadística e indicaciones visuales. Si el píxel está
+    demasiado cerca del borde, devuelve una respuesta vacía con la razón.
+
+    Args:
+        hdul: Archivo FITS abierto.
+        pixel_x: Coordenada X del píxel seleccionado.
+        pixel_y: Coordenada Y del píxel seleccionado.
+
+    Returns:
+        Diccionario con clase candidata, confianza, color, flujo, SNR, rango
+        espectral, puntos del espectro y sugerencias visuales.
+    """
     try:
         cut = _extract_cutout(hdul, pixel_x, pixel_y)
     except ValueError as e:
@@ -381,6 +478,15 @@ def analyze_pixel(hdul: fits.HDUList, pixel_x: int, pixel_y: int) -> dict:
 
 
 def _empty_result(reason: str) -> dict:
+    """Construye una respuesta estándar cuando no puede completarse el análisis.
+
+    Args:
+        reason: Motivo que se incluirá en la lista de razones del resultado.
+
+    Returns:
+        Diccionario con la misma estructura que ``analyze_pixel``, pero con
+        valores nulos, listas vacías y clase ``UNKNOWN``.
+    """
     return {
         "candidate_class": "UNKNOWN",
         "confidence": 0.0,
