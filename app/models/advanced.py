@@ -67,3 +67,26 @@ class SuggestTargetResponse(BaseModel):
     target: SuggestedTarget | None = None
     candidates_examined: int = 0
     reason: str = ""
+
+class BrightPixelItem(BaseModel):
+    rank: int
+    ra_deg: float
+    dec_deg: float
+    flux_short: float
+    flux_long: float
+    snr_short: float
+    snr_long: float
+    ratio: float
+    pixel_short_x: int
+    pixel_short_y: int
+    pixel_long_x: int
+    pixel_long_y: int
+
+
+class BrightestValidResponse(BaseModel):
+    sector_id: str
+    epoch: str
+    pair: str
+    n_candidates_scanned: int
+    n_valid: int
+    pixels: list[BrightPixelItem]

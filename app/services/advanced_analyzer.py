@@ -50,17 +50,10 @@ TELESCOPE_PAIRS = [
     (3, 6),
 ]
 
-# Banda diagnóstica que cubre cada par
-PAIR_DIAGNOSTIC = {
-    (1, 4): "water_ice_3.05um",
-    (2, 5): "co2_ice_4.27um",
-    (3, 6): "silicates_2.0um",
-}
-
-# Umbrales de clasificación del ratio
-ABSORPTION_STRONG = 0.7
-ABSORPTION_WEAK = 0.9
-EMISSION_WEAK = 1.1
+# Clasificaciones basadas en la forma del SED (2 puntos), no en absorción:
+STEEP_RED = 0.7       # ratio < 0.7 → caída pronunciada hacia λ largas
+MODERATE_RED = 0.9    # 0.7-0.9 → caída moderada
+FLAT_MAX = 1.1        # 0.9-1.1 → plano
 MIN_SNR = 3.0
 MIN_RATIO_SIGNIFICANCE = 2.0  # |ratio - 1| / sigma_ratio
 
@@ -284,122 +277,107 @@ def classify_pair(
     valid_short: float = 1.0,
     valid_long: float = 1.0,
 ) -> dict:
-    band = PAIR_DIAGNOSTIC.get(pair)
-
-    # 🆕 Detector completamente enmascarado (saturación, cosmic, dead)
     if valid_short < 0.1:
         return {
             "classification": "MASKED",
             "confidence": 0.0,
-            "diagnostic_band": band,
-            "reason": (
-                f"D{pair[0]} aperture is 100% masked "
-                f"(valid_fraction={valid_short:.2f}). "
-                f"Likely saturated source or cosmic ray."
-            ),
+            "diagnostic_band": None,
+            "reason": f"D{pair[0]} is masked (saturated or invalid pixels).",
         }
     if valid_long < 0.1:
         return {
             "classification": "MASKED",
             "confidence": 0.0,
-            "diagnostic_band": band,
-            "reason": (
-                f"D{pair[1]} aperture is 100% masked "
-                f"(valid_fraction={valid_long:.2f}). "
-                f"Likely saturated source or cosmic ray."
-            ),
+            "diagnostic_band": None,
+            "reason": f"D{pair[1]} is masked (saturated or invalid pixels).",
         }
-
-    # 🆕 Sin fuente
     if flux_short is not None and flux_short <= 0:
         return {
             "classification": "NO_SOURCE",
             "confidence": 0.0,
-            "diagnostic_band": band,
-            "reason": f"No source: flux in D{pair[0]} = {flux_short:.4g} (≤0)",
+            "diagnostic_band": None,
+            "reason": f"No source: flux in D{pair[0]} = {flux_short:.4g}",
         }
     if flux_long is not None and flux_long <= 0:
         return {
             "classification": "NO_SOURCE",
             "confidence": 0.0,
-            "diagnostic_band": band,
-            "reason": f"No source: flux in D{pair[1]} = {flux_long:.4g} (≤0)",
+            "diagnostic_band": None,
+            "reason": f"No source: flux in D{pair[1]} = {flux_long:.4g}",
         }
-
     if snr_short is None or snr_short < MIN_SNR:
         return {
             "classification": "UNDETERMINED",
             "confidence": 0.0,
-            "diagnostic_band": band,
+            "diagnostic_band": None,
             "reason": f"Low S/N in D{pair[0]} ({snr_short})",
         }
     if snr_long is None or snr_long < MIN_SNR:
         return {
             "classification": "UNDETERMINED",
             "confidence": 0.0,
-            "diagnostic_band": band,
+            "diagnostic_band": None,
             "reason": f"Low S/N in D{pair[1]} ({snr_long})",
         }
     if ratio is None:
         return {
             "classification": "UNDETERMINED",
             "confidence": 0.0,
-            "diagnostic_band": band,
+            "diagnostic_band": None,
             "reason": "Ratio could not be computed",
         }
 
-    # Significancia de |ratio - 1|
     delta = abs(ratio - 1.0)
-    if ratio_err is not None and ratio_err > 0:
-        significance = delta / ratio_err
-    else:
-        significance = delta / 0.15  # fallback heurístico
+    significance = delta / ratio_err if (ratio_err and ratio_err > 0) else delta / 0.15
 
     if significance < MIN_RATIO_SIGNIFICANCE:
         return {
-            "classification": "CONTINUUM",
+            "classification": "FLAT_SED",
             "confidence": 0.0,
-            "diagnostic_band": band,
-            "reason": f"Ratio {ratio:.2f} consistent with flat continuum",
+            "diagnostic_band": None,
+            "reason": (
+                f"Ratio F(D{pair[1]})/F(D{pair[0]}) = {ratio:.2f} consistent with flat SED."
+            ),
         }
 
-    # Confianza: qué tan lejos del umbral (normalizada 0-1)
     confidence = float(np.clip((significance - MIN_RATIO_SIGNIFICANCE) / 6.0, 0.0, 1.0))
 
-    if ratio < ABSORPTION_STRONG:
+    if ratio < STEEP_RED:
         return {
-            "classification": "ABSORPTION",
+            "classification": "STEEP_RED_SED",
             "confidence": confidence,
-            "diagnostic_band": band,
+            "diagnostic_band": None,
             "reason": (
-                f"Strong absorption: F(D{pair[1]})/F(D{pair[0]}) = {ratio:.2f}. "
-                f"Consistent with {band or 'absorption feature'}."
+                f"Steep red SED: F(D{pair[1]})/F(D{pair[0]}) = {ratio:.2f}. "
+                f"Consistent with a hot stellar continuum falling towards long λ "
+                f"(expected for most stars, NOT a water-ice detection). "
+                f"Absorption features require 3+ points around 3 μm."
             ),
         }
-    if ratio < ABSORPTION_WEAK:
+    if ratio < MODERATE_RED:
         return {
-            "classification": "ABSORPTION",
+            "classification": "RED_SED",
             "confidence": confidence * 0.6,
-            "diagnostic_band": band,
+            "diagnostic_band": None,
             "reason": (
-                f"Moderate absorption: F(D{pair[1]})/F(D{pair[0]}) = {ratio:.2f}. "
-                f"Possible {band or 'absorption'}."
+                f"Moderate red SED: ratio = {ratio:.2f}. "
+                f"Consistent with warm stellar continuum or reddened source."
             ),
         }
-    if ratio <= EMISSION_WEAK:
+    if ratio <= FLAT_MAX:
         return {
-            "classification": "CONTINUUM",
+            "classification": "FLAT_SED",
             "confidence": 0.0,
-            "diagnostic_band": band,
-            "reason": f"Flat continuum: F(D{pair[1]})/F(D{pair[0]}) = {ratio:.2f}",
+            "diagnostic_band": None,
+            "reason": f"Flat SED: ratio = {ratio:.2f}",
         }
     return {
-        "classification": "EMISSION",
+        "classification": "RISING_SED",
         "confidence": confidence,
-        "diagnostic_band": band,
+        "diagnostic_band": None,
         "reason": (
-            f"Flux increases at long λ: F(D{pair[1]})/F(D{pair[0]}) = {ratio:.2f}. "
-            f"Consistent with hot dust emission."
+            f"Rising SED: F(D{pair[1]})/F(D{pair[0]}) = {ratio:.2f}. "
+            f"Consistent with thermal dust emission or cool object."
         ),
     }
 

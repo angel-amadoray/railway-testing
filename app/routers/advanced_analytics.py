@@ -9,15 +9,53 @@ from app.models.advanced import (
     BrightPixel,
     BrightestPixelsResponse,
     SuggestedTarget,
-    SuggestTargetResponse
+    SuggestTargetResponse,
+    BrightPixelItem,
+    BrightestValidResponse
 )
 from app.services import advanced_analyzer as aa
 import numpy as np
 from app.services import fits_loader as fl
+from app.services.fits_loader import BAD_BITS, get_spatial_wcs
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/advanced-analytics", tags=["advanced-analytics"])
 
+# ------ Helpers ---------
+def _quick_photometry(x: int, y: int, image: np.ndarray, valid: np.ndarray) -> tuple[float, float]:
+    """
+    Fotometría rápida desde arrays preloaded. Sin cargar FITS.
+    Devuelve (flux, snr) o (None, None) si no hay datos suficientes.
+    """
+    half = 15
+    ny, nx = image.shape
+    x0, x1 = max(0, x - half), min(nx, x + half + 1)
+    y0, y1 = max(0, y - half), min(ny, y + half + 1)
+    cut = image[y0:y1, x0:x1].astype(np.float32)
+    cut_v = valid[y0:y1, x0:x1]
+    cut = np.where(cut_v, cut, np.nan)
+
+    cy, cx = y - y0, x - x0
+    yy, xx = np.mgrid[0:cut.shape[0], 0:cut.shape[1]]
+    r2 = (xx - cx) ** 2 + (yy - cy) ** 2
+    ap = r2 <= 25
+    ann = (r2 >= 64) & (r2 <= 225)
+
+    ap_v = cut[ap]
+    ann_v = cut[ann]
+    ap_v = ap_v[np.isfinite(ap_v)]
+    ann_v = ann_v[np.isfinite(ann_v)]
+
+    if ap_v.size < 3 or ann_v.size < 3:
+        return None, None
+
+    bkg = float(np.median(ann_v))
+    flux = float(ap_v.sum() - bkg * ap_v.size)
+    sigma = float(np.std(ann_v))
+    snr = float(flux / (sigma * np.sqrt(ap_v.size))) if sigma > 0 else 0.0
+    return flux, snr
+
+# ------ Routers ---------
 
 @router.get("/pair-spectrum", response_model=PairSpectrumResponse)
 def pair_spectrum(
@@ -292,4 +330,122 @@ def suggest_target(
             "detector are either saturated or invalid in the long detector. "
             "Try reducing min_snr or increasing max_candidates."
         ),
+    )
+
+@router.get("/brightest-valid", response_model=BrightestValidResponse)
+def brightest_valid(
+    request: Request,
+    sector_id: str,
+    epoch: str,
+    detector_short: int = Query(1, ge=1, le=6),
+    detector_long: int = Query(4, ge=1, le=6),
+    top_n: int = Query(20, ge=5, le=50),
+    min_snr: float = Query(10.0, gt=0),
+    obs_id: str | None = None,
+    visit: int | None = None,
+):
+    """
+    Devuelve los `top_n` píxeles brillantes en D_short que tengan también
+    flux válido en D_long. Filtra saturados/masked automáticamente.
+    """
+    hotspot = request.app.state.hotspots.get(sector_id)
+    if hotspot is None:
+        raise HTTPException(404, f"Sector '{sector_id}' not found")
+    if epoch not in hotspot.epochs:
+        raise HTTPException(400, f"Epoch '{epoch}' not available")
+
+    try:
+        hdul_s = fl.load_local_fits(
+            sector_id=sector_id, epoch=epoch, detector=detector_short,
+            obs_id=obs_id, visit=visit,
+        )
+        hdul_l = fl.load_local_fits(
+            sector_id=sector_id, epoch=epoch, detector=detector_long,
+            obs_id=obs_id, visit=visit,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(404, f"Missing FITS: {e}")
+
+    try:
+        image_s = np.asarray(hdul_s["IMAGE"].data, dtype=np.float32)
+        flags_s = hdul_s["FLAGS"].data
+        valid_s = (flags_s & BAD_BITS) == 0
+        clean_s = np.where(valid_s, image_s, 0.0)
+
+        image_l = np.asarray(hdul_l["IMAGE"].data, dtype=np.float32)
+        flags_l = hdul_l["FLAGS"].data
+        valid_l = (flags_l & BAD_BITS) == 0
+        ny_l, nx_l = image_l.shape
+
+        wcs_s = get_spatial_wcs(hdul_s)
+        wcs_l = get_spatial_wcs(hdul_l)
+
+        # Top N*10 candidatos de D_short
+        n_candidates = min(top_n * 10, 500)
+        flat = clean_s.ravel()
+        top_idx = np.argpartition(flat, -n_candidates)[-n_candidates:]
+        ys, xs = np.unravel_index(top_idx, clean_s.shape)
+
+        # Ordenar por flujo descendente
+        order = np.argsort(-flat[top_idx])
+        ys = ys[order]
+        xs = xs[order]
+
+        results: list[BrightPixelItem] = []
+
+        for x_s, y_s in zip(xs, ys):
+            if len(results) >= top_n:
+                break
+
+            try:
+                ra_arr = wcs_s.all_pix2world(float(x_s), float(y_s), 0)
+                ra = float(np.asarray(ra_arr[0]).ravel()[0])
+                dec = float(np.asarray(ra_arr[1]).ravel()[0])
+                if not (np.isfinite(ra) and np.isfinite(dec)):
+                    continue
+            except Exception:
+                continue
+
+            try:
+                raw = wcs_l.all_world2pix(ra, dec, 0)
+                arr = np.asarray(raw).ravel()
+                x_l, y_l = int(round(float(arr[0]))), int(round(float(arr[1])))
+                if not (0 <= x_l < nx_l and 0 <= y_l < ny_l):
+                    continue
+            except Exception:
+                continue
+
+            fs, snr_s = _quick_photometry(int(x_s), int(y_s), image_s, valid_s)
+            fl_, snr_l = _quick_photometry(x_l, y_l, image_l, valid_l)
+
+            if fs is None or fl_ is None or fs <= 0 or fl_ <= 0:
+                continue
+            if snr_s < min_snr or snr_l < min_snr:
+                continue
+
+            results.append(BrightPixelItem(
+                rank=len(results) + 1,
+                ra_deg=ra,
+                dec_deg=dec,
+                flux_short=fs,
+                flux_long=fl_,
+                snr_short=snr_s,
+                snr_long=snr_l,
+                ratio=fl_ / fs,
+                pixel_short_x=int(x_s),
+                pixel_short_y=int(y_s),
+                pixel_long_x=x_l,
+                pixel_long_y=y_l,
+            ))
+    finally:
+        hdul_s.close()
+        hdul_l.close()
+
+    return BrightestValidResponse(
+        sector_id=sector_id,
+        epoch=epoch,
+        pair=f"D{detector_short}+D{detector_long}",
+        n_candidates_scanned=n_candidates,
+        n_valid=len(results),
+        pixels=results,
     )
