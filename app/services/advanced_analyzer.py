@@ -30,11 +30,14 @@ import logging
 
 import numpy as np
 from astropy.io import fits
+from astropy import units as u
+from scipy.optimize import brentq
 
 from app.services.fits_loader import (
     DETECTOR_WAVELENGTH_RANGES,
     get_spatial_wcs,
     load_local_fits,
+    get_spectral_wcs
 )
 from app.services.spectral_analyzer import (
     _aperture_photometry,
@@ -56,7 +59,50 @@ MODERATE_RED = 0.9    # 0.7-0.9 → caída moderada
 FLAT_MAX = 1.1        # 0.9-1.1 → plano
 MIN_SNR = 3.0
 MIN_RATIO_SIGNIFICANCE = 2.0  # |ratio - 1| / sigma_ratio
+_HC_K = 14387.77  # μm·K
 
+# --------------------------------------------------------------------------- #
+# Utilidades ratios
+# --------------------------------------------------------------------------- #
+
+def _bb_fnu_ratio(T: float, lam_s: float, lam_l: float) -> float:
+    """
+    Ratio F_ν(long)/F_ν(short) para un cuerpo negro a temperatura T.
+
+    B_ν(λ, T) ∝ (1/λ³) / (e^(hc/λkT) - 1)
+    """
+    if T <= 0 or lam_s <= 0 or lam_l <= 0:
+        return 0.0
+    xs = _HC_K / (lam_s * T)
+    xl = _HC_K / (lam_l * T)
+    if xs > 700 or xl > 700:  # evita overflow
+        return 0.0
+    return float((lam_s / lam_l) ** 3 * (np.expm1(xs) / np.expm1(xl)))
+
+
+def _color_temperature(
+    ratio: float | None,
+    lam_s: float | None,
+    lam_l: float | None,
+) -> float | None:
+    """Invierte el ratio observado asumiendo cuerpo negro. None si no converge."""
+    if ratio is None or lam_s is None or lam_l is None:
+        return None
+    if ratio <= 0 or lam_s <= 0 or lam_l <= 0 or lam_l <= lam_s:
+        return None
+
+    def f(T: float) -> float:
+        return _bb_fnu_ratio(T, lam_s, lam_l) - ratio
+
+    try:
+        # f(500K) > 0 (frío = ratio alto), f(30000K) < 0 (caliente = ratio bajo)
+        f_lo = f(500.0)
+        f_hi = f(30000.0)
+        if f_lo * f_hi > 0:
+            return None  # fuera de rango
+        return float(brentq(f, 500.0, 30000.0, maxiter=100))
+    except (ValueError, RuntimeError):
+        return None
 
 # --------------------------------------------------------------------------- #
 # Utilidades geométricas
@@ -176,6 +222,20 @@ def detect_covering_pair(
 # Fotometría en un detector
 # --------------------------------------------------------------------------- #
 
+def _pixel_wavelength(hdul, x: int, y: int) -> tuple[float | None, float | None]:
+    """Devuelve (λ_μm, Δλ_μm) del píxel (x, y) usando el WCS espectral."""
+    try:
+        wcs = get_spectral_wcs(hdul)
+        world = wcs.pixel_to_world(float(x), float(y))
+        lam = float(np.asarray(world[0].to(u.um).value).ravel()[0])
+        dlam = float(np.asarray(world[1].to(u.um).value).ravel()[0])
+        if not (np.isfinite(lam) and lam > 0):
+            return None, None
+        return lam, dlam
+    except Exception as e:
+        logger.warning("Spectral WCS evaluation failed: %s", e)
+        return None, None
+
 def _photometry_detector(
     sector_id: str,
     epoch: str,
@@ -223,6 +283,8 @@ def _photometry_detector(
         if pixel is None:
             return result
 
+        lam_pix, dlam_pix = _pixel_wavelength(hdul, pixel[0], pixel[1])
+
         cut = _extract_cutout(hdul, pixel[0], pixel[1])
         photo = _aperture_photometry(cut)
 
@@ -233,6 +295,9 @@ def _photometry_detector(
         result["flux_err"] = photo["flux_err"]
         result["snr"] = photo["snr"]
         result["valid_fraction_aperture"] = photo["valid_fraction_aperture"]
+        result["wavelength_center_um"] = lam_pix or ((lo_um + hi_um) / 2.0)
+        result["wavelength_bandwidth_um"] = dlam_pix
+
     except ValueError as e:
         logger.info("Cutout failed for D%d: %s", detector, e)
     finally:
@@ -271,114 +336,99 @@ def classify_pair(
     ratio_err: float | None,
     snr_short: float | None,
     snr_long: float | None,
+    lam_short: float | None,
+    lam_long: float | None,
     pair: tuple[int, int],
     flux_short: float | None = None,
     flux_long: float | None = None,
     valid_short: float = 1.0,
     valid_long: float = 1.0,
 ) -> dict:
+    """Clasifica a partir de la temperatura de color derivada del ratio."""
+
+    # --- Guardas ---
     if valid_short < 0.1:
-        return {
-            "classification": "MASKED",
-            "confidence": 0.0,
-            "diagnostic_band": None,
-            "reason": f"D{pair[0]} is masked (saturated or invalid pixels).",
-        }
+        return _undet(f"D{pair[0]} aperture is masked.")
     if valid_long < 0.1:
-        return {
-            "classification": "MASKED",
-            "confidence": 0.0,
-            "diagnostic_band": None,
-            "reason": f"D{pair[1]} is masked (saturated or invalid pixels).",
-        }
+        return _undet(f"D{pair[1]} aperture is masked.")
     if flux_short is not None and flux_short <= 0:
-        return {
-            "classification": "NO_SOURCE",
-            "confidence": 0.0,
-            "diagnostic_band": None,
-            "reason": f"No source: flux in D{pair[0]} = {flux_short:.4g}",
-        }
+        return _undet(f"No source: flux in D{pair[0]} = {flux_short:.4g}")
     if flux_long is not None and flux_long <= 0:
-        return {
-            "classification": "NO_SOURCE",
-            "confidence": 0.0,
-            "diagnostic_band": None,
-            "reason": f"No source: flux in D{pair[1]} = {flux_long:.4g}",
-        }
+        return _undet(f"No source: flux in D{pair[1]} = {flux_long:.4g}")
     if snr_short is None or snr_short < MIN_SNR:
-        return {
-            "classification": "UNDETERMINED",
-            "confidence": 0.0,
-            "diagnostic_band": None,
-            "reason": f"Low S/N in D{pair[0]} ({snr_short})",
-        }
+        return _undet(f"Low S/N in D{pair[0]} ({snr_short})")
     if snr_long is None or snr_long < MIN_SNR:
-        return {
-            "classification": "UNDETERMINED",
-            "confidence": 0.0,
-            "diagnostic_band": None,
-            "reason": f"Low S/N in D{pair[1]} ({snr_long})",
-        }
+        return _undet(f"Low S/N in D{pair[1]} ({snr_long})")
     if ratio is None:
+        return _undet("Ratio could not be computed.")
+
+    # --- Temperatura de color ---
+    T = _color_temperature(ratio, lam_short, lam_long)
+
+    # Error de T propagado
+    T_err = None
+    if T is not None and ratio_err is not None and ratio_err > 0 and lam_short and lam_long:
+        # dT/dratio via diferencias finitas
+        eps = max(ratio * 0.01, 0.005)
+        T_hi = _color_temperature(ratio + eps, lam_short, lam_long)
+        T_lo = _color_temperature(max(ratio - eps, 0.01), lam_short, lam_long)
+        if T_hi is not None and T_lo is not None:
+            T_err = abs((T_hi - T_lo) / (2 * eps)) * ratio_err
+
+    if T is None:
         return {
             "classification": "UNDETERMINED",
             "confidence": 0.0,
             "diagnostic_band": None,
-            "reason": "Ratio could not be computed",
-        }
-
-    delta = abs(ratio - 1.0)
-    significance = delta / ratio_err if (ratio_err and ratio_err > 0) else delta / 0.15
-
-    if significance < MIN_RATIO_SIGNIFICANCE:
-        return {
-            "classification": "FLAT_SED",
-            "confidence": 0.0,
-            "diagnostic_band": None,
             "reason": (
-                f"Ratio F(D{pair[1]})/F(D{pair[0]}) = {ratio:.2f} consistent with flat SED."
+                f"Ratio {ratio:.2f} is outside the blackbody range for "
+                f"λ={lam_short:.2f}-{lam_long:.2f} μm. "
+                f"Likely a non-stellar source or measurement issue."
             ),
+            "color_temperature_k": None,
+            "color_temperature_err_k": None,
         }
 
-    confidence = float(np.clip((significance - MIN_RATIO_SIGNIFICANCE) / 6.0, 0.0, 1.0))
+    # --- Clasificación por T ---
+    if T > 10000:
+        cls, label, conf = "HOT_STAR", "Estrella caliente (O/B/A)", 0.7
+    elif T > 5500:
+        cls, label, conf = "SUN_LIKE_STAR", "Estrella tipo solar (F/G)", 0.6
+    elif T > 3500:
+        cls, label, conf = "COOL_STAR", "Estrella fría (K/M)", 0.5
+    elif T > 1500:
+        cls, label, conf = "VERY_COOL", "Enana M tardía / enana marrón / polvo", 0.4
+    else:
+        cls, label, conf = "COOL_DUSTY", "Polvo frío o medición dudosa", 0.3
 
-    if ratio < STEEP_RED:
-        return {
-            "classification": "STEEP_RED_SED",
-            "confidence": confidence,
-            "diagnostic_band": None,
-            "reason": (
-                f"Steep red SED: F(D{pair[1]})/F(D{pair[0]}) = {ratio:.2f}. "
-                f"Consistent with a hot stellar continuum falling towards long λ "
-                f"(expected for most stars, NOT a water-ice detection). "
-                f"Absorption features require 3+ points around 3 μm."
-            ),
-        }
-    if ratio < MODERATE_RED:
-        return {
-            "classification": "RED_SED",
-            "confidence": confidence * 0.6,
-            "diagnostic_band": None,
-            "reason": (
-                f"Moderate red SED: ratio = {ratio:.2f}. "
-                f"Consistent with warm stellar continuum or reddened source."
-            ),
-        }
-    if ratio <= FLAT_MAX:
-        return {
-            "classification": "FLAT_SED",
-            "confidence": 0.0,
-            "diagnostic_band": None,
-            "reason": f"Flat SED: ratio = {ratio:.2f}",
-        }
+    T_str = f"T_color ≈ {T:.0f} K"
+    T_err_str = f" ± {T_err:.0f} K" if T_err is not None else ""
+
+    reason = (
+        f"{label}. {T_str}{T_err_str} "
+        f"(from Fν ratio F(D{pair[1]})/F(D{pair[0]}) = {ratio:.2f}). "
+        f"Color temperature is degenerate with dust reddening; "
+        f"interpretation requires additional data."
+    )
+
     return {
-        "classification": "RISING_SED",
-        "confidence": confidence,
+        "classification": cls,
+        "confidence": conf,
         "diagnostic_band": None,
-        "reason": (
-            f"Rising SED: F(D{pair[1]})/F(D{pair[0]}) = {ratio:.2f}. "
-            f"Consistent with thermal dust emission or cool object."
-        ),
+        "reason": reason,
+        "color_temperature_k": T,
+        "color_temperature_err_k": T_err,
+    }
+
+
+def _undet(reason: str) -> dict:
+    return {
+        "classification": "UNDETERMINED",
+        "confidence": 0.0,
+        "diagnostic_band": None,
+        "reason": reason,
+        "color_temperature_k": None,
+        "color_temperature_err_k": None,
     }
 
 
@@ -443,6 +493,8 @@ def analyze_pair(
         ratio_err=ratio_err,
         snr_short=short["snr"],
         snr_long=long["snr"],
+        lam_short=short["wavelength_center_um"],
+        lam_long=long["wavelength_center_um"],
         pair=pair,
         flux_short=short["flux"],
         flux_long=long["flux"],

@@ -90,3 +90,11 @@ class BrightestValidResponse(BaseModel):
     n_candidates_scanned: int
     n_valid: int
     pixels: list[BrightPixelItem]
+
+class PairClassification(BaseModel):
+    classification: str  # HOT_STAR | SUN_LIKE_STAR | COOL_STAR | VERY_COOL | COOL_DUSTY | UNDETERMINED
+    confidence: float
+    diagnostic_band: str | None = None
+    reason: str
+    color_temperature_k: float | None = None
+    color_temperature_err_k: float | None = None
