@@ -31,6 +31,15 @@ logger = logging.getLogger(__name__)
 
 
 def _is_configured() -> bool:
+    """Comprueba si existe la configuración mínima para acceder a OCI.
+
+    Verifica endpoint, clave de acceso, secreto y nombre de bucket mediante la
+    configuración global de la aplicación.
+
+    Returns:
+        ``True`` cuando todos los valores están presentes; en otro caso,
+        ``False``.
+    """
     return bool(
         settings.oci_endpoint
         and settings.oci_access_key
@@ -40,6 +49,17 @@ def _is_configured() -> bool:
 
 
 def _get_client():
+    """Crea el cliente boto3 S3 compatible con OCI Object Storage.
+
+    Configura endpoint, credenciales, región, firma S3v4 y validación de checksums
+    compatible con operaciones multipart de OCI.
+
+    Returns:
+        Cliente boto3 configurado para el bucket OCI.
+
+    Raises:
+        RuntimeError: Si faltan opciones o credenciales de almacenamiento.
+    """
     if not _is_configured():
         raise RuntimeError(
             "OCI storage not configured. Set OCI_ENDPOINT, OCI_ACCESS_KEY, "
@@ -61,17 +81,38 @@ def _get_client():
 
 
 def _remote_key(sector_id: str, epoch: str, filename: str) -> str:
+    """Construye la clave S3 completa de un archivo FITS.
+
+    La clave se forma como ``<prefijo>/<sector>/<época>/<archivo>`` usando el
+    prefijo configurado en la aplicación.
+    """
     return f"{settings.oci_prefix}/{sector_id}/{epoch}/{filename}"
 
 
 def _local_dir(sector_id: str, epoch: str) -> Path:
+    """Construye el directorio local de datos para un sector y una época."""
     return Path(settings.data_dir) / sector_id / epoch
 
 
 def list_remote_files(sector_id: str, epoch: str) -> list[dict]:
     """
-    Lista los FITS disponibles en el bucket para un sector/epoch.
-    Devuelve [{"filename": ..., "size_mb": ..., "key": ...}, ...].
+    Lista los archivos FITS disponibles remotamente para un sector y época.
+
+    Recorre todas las páginas de ``list_objects_v2``, ignora objetos que no
+    terminen en ``.fits`` y ordena los resultados por nombre.
+
+    Args:
+        sector_id: Identificador del sector remoto.
+        epoch: Época cuyos archivos se desean consultar.
+
+    Returns:
+        Lista de diccionarios con ``filename``, tamaño aproximado en MB y
+        ``key`` S3 completa.
+
+    Raises:
+        RuntimeError: Si el cliente no puede configurarse.
+        ClientError o BotoCoreError: Si OCI rechaza o no puede completar la
+            enumeración del bucket.
     """
     client = _get_client()
     prefix = f"{settings.oci_prefix}/{sector_id}/{epoch}/"
@@ -95,7 +136,22 @@ def list_remote_files(sector_id: str, epoch: str) -> list[dict]:
 
 
 def download_file(remote_key: str, local_path: Path) -> Path:
-    """Descarga un objeto del bucket al disco. Crea directorios si faltan."""
+    """Descarga un objeto remoto y lo guarda en una ruta local.
+
+    Crea los directorios padres antes de descargar. Si la transferencia falla y
+    dejó un archivo parcial, intenta eliminarlo para no dejar un FITS corrupto.
+
+    Args:
+        remote_key: Clave del objeto dentro del bucket OCI.
+        local_path: Ruta local de destino.
+
+    Returns:
+        La misma ruta local después de una descarga exitosa.
+
+    Raises:
+        RuntimeError: Si falta configuración OCI.
+        ClientError o BotoCoreError: Si falla la descarga.
+    """
     client = _get_client()
     local_path.parent.mkdir(parents=True, exist_ok=True)
     logger.info("OCI download: s3://%s/%s → %s",
@@ -121,11 +177,26 @@ def download_fits_if_missing(
     visit: int | None = None,
 ) -> Path:
     """
-    Si el FITS ya existe localmente (cualquier combinación compatible con los
-    filtros detector/obs_id/visit), lo devuelve. Si no, intenta descargarlo
-    desde OCI.
+    Obtiene un FITS local o descarga el único candidato compatible desde OCI.
 
-    Lanza FileNotFoundError si no existe localmente y no se puede descargar.
+    Primero busca en disco usando detector, observación y visita. Si no existe,
+    comprueba que las descargas estén habilitadas, lista los objetos remotos,
+    filtra sus metadatos y descarga el único resultado coincidente.
+
+    Args:
+        sector_id: Identificador del sector.
+        epoch: Época de observación.
+        detector: Número de detector requerido.
+        obs_id: Identificador de observación opcional.
+        visit: Número de visita opcional.
+
+    Returns:
+        Ruta local del FITS encontrado o descargado.
+
+    Raises:
+        FileNotFoundError: Si no hay archivo local/remoto, las descargas están
+            deshabilitadas, OCI no está configurado o falla la enumeración.
+        ValueError: Si hay múltiples candidatos remotos ambiguos.
     """
     # 1) ¿Ya está local?
     try:
@@ -189,7 +260,23 @@ def download_fits_if_missing(
 
 
 def upload_file(local_path: Path, sector_id: str, epoch: str) -> str:
-    """Sube un FITS local al bucket. Devuelve la remote_key."""
+    """Sube un archivo local al bucket OCI y devuelve su clave remota.
+
+    El nombre del archivo local se conserva y se coloca bajo el prefijo,
+    sector y época configurados.
+
+    Args:
+        local_path: Ruta del archivo que se desea subir.
+        sector_id: Identificador del sector de destino.
+        epoch: Época de observación de destino.
+
+    Returns:
+        Clave S3 remota usada para el objeto.
+
+    Raises:
+        RuntimeError: Si OCI no está configurado.
+        ClientError o BotoCoreError: Si falla la subida.
+    """
     client = _get_client()
     remote_key = _remote_key(sector_id, epoch, local_path.name)
     logger.info("OCI upload: %s → s3://%s/%s",
