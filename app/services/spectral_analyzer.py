@@ -1,19 +1,23 @@
 """
-Análisis de un micro-espectro local de SPHEREx.
+Análisis espectral local de un píxel de SPHEREx (Level 2, un solo detector).
 
-Dado un pixel (x, y) en un detector, extrae un cutout de 100×100 px y
-calcula propiedades espectrales:
+IMPORTANTE — limitaciones físicas:
+  - Un exposure contiene UNA λ por píxel. Con un solo detector, una fuente
+    puntual ocupa solo ~5-10 filas → 1-3 nm de rango espectral efectivo.
+  - Esto es insuficiente para medir temperatura, composición o espectro real.
+  - Solo se puede medir "color": F(λ_larga) / F(λ_corta).
+  - La clasificación es un CANDIDATO estadístico, no una identificación.
+    STAR_LIKE  → color_ratio < 0.85 (más flujo a λ cortas = más azul)
+    ROCKY_LIKE → color_ratio > 1.15 (más flujo a λ largas = más rojo)
+    UNKNOWN    → plano, ruido, o rango espectral insuficiente
 
-- Micro-espectro: flujo promedio por fila (cada fila ≈ una λ).
-- Pendiente log-log (spectral_slope): color espectral.
-  - slope < 0 → más flujo a λ cortas → objeto azul/caliente.
-  - slope > 0 → más flujo a λ largas → objeto rojo/frío.
-- Flujo total → magnitud relativa.
-- Clasificación heurística en STAR / ASTEROID / UNKNOWN.
-
-NO pretende ser ciencia rigurosa: es una interpretación visual con
-disclaimer. Con un solo detector, el rango espectral es ~0.017 μm, apenas
-suficiente para medir "color", no para temperatura ni composición.
+Pipeline:
+  1. Recorte 60×60 alrededor del click.
+  2. Fotometría de apertura: flux en radio 5 px, fondo en anillo 8-15 px.
+  3. Micro-espectro: apertura deslizante en cada fila con flujo > umbral.
+  4. Color ratio: F_long / F_short en las filas extremas de λ.
+  5. Significancia del ratio propagando errores (VARIANCE).
+  6. Solo clasificar si |ratio - 1| > 1.5σ_ratio.
 """
 
 from __future__ import annotations
@@ -25,309 +29,378 @@ from astropy.io import fits
 
 from app.services.fits_loader import (
     get_clean_image,
+    get_variance,
     get_wavelength_map,
 )
 
 logger = logging.getLogger(__name__)
 
-CUTOUT_SIZE = 100  # px de alto × ancho
-MIN_VALID_FRACTION = 0.10  # si <10% de píxeles válidos → unknown
+# --- Configuración ---
+CUTOUT_SIZE = 60
+APERTURE_RADIUS = 5
+ANNULUS_INNER = 8
+ANNULUS_OUTER = 15
+MIN_SNR = 3.0
+MIN_SIGMA_RATIO = 1.5
+MIN_WAVELENGTH_RANGE_NM = 3.0
 
 
 # --------------------------------------------------------------------------- #
-# Extracción del micro-espectro
+# 1. Recorte
 # --------------------------------------------------------------------------- #
 
-def extract_local_spectrum(
-    hdul: fits.HDUList,
-    pixel_x: int,
-    pixel_y: int,
-    cutout_size: int = CUTOUT_SIZE,
-) -> dict:
-    """
-    Extrae un micro-espectro local centrado en (pixel_x, pixel_y).
-
-    Devuelve:
-        {
-            "wavelengths_um": list[float],   # λ por fila del cutout
-            "flux_per_row": list[float],     # flujo promedio por fila
-            "wavelength_range_um": (λ_min, λ_max),
-            "total_flux": float,             # suma de flujo
-            "peak_flux": float,              # max de flux_per_row
-            "valid_fraction": float,         # fracción de píxeles no-enmascarados
-            "shape": (ny, nx),               # forma del cutout
-        }
-    """
+def _extract_cutout(hdul: fits.HDUList, pixel_x: int, pixel_y: int) -> dict:
     clean = get_clean_image(hdul, subtract_zodi=True)
-    wave_map = get_wavelength_map(hdul, downsample=4)
+    wave = get_wavelength_map(hdul, downsample=4)
+    var = get_variance(hdul)
 
     ny, nx = clean.shape
-    half = cutout_size // 2
+    half = CUTOUT_SIZE // 2
     x0 = max(0, pixel_x - half)
     x1 = min(nx, pixel_x + half)
     y0 = max(0, pixel_y - half)
     y1 = min(ny, pixel_y + half)
 
-    if x1 - x0 < 2 or y1 - y0 < 2:
+    if x1 - x0 < APERTURE_RADIUS * 4 or y1 - y0 < APERTURE_RADIUS * 4:
         raise ValueError(
-            f"Cutout demasiado pequeño en pixel ({pixel_x},{pixel_y}). "
-            f"Shape cutout: ({y1-y0}, {x1-x0})"
+            f"Cutout demasiado pequeño en ({pixel_x},{pixel_y}). "
+            f"Muy cerca del borde del detector ({nx}×{ny})."
         )
-
-    cut_clean = clean[y0:y1, x0:x1]
-    cut_wave = wave_map[y0:y1, x0:x1]
-
-    # Fracción de píxeles válidos (no enmascarados)
-    valid_mask = cut_clean != 0
-    valid_fraction = float(valid_mask.mean())
-
-    if valid_fraction < MIN_VALID_FRACTION:
-        logger.warning(
-            "Valid fraction %.2f%% < %.2f%% en (%d,%d); retornando vacío",
-            valid_fraction * 100, MIN_VALID_FRACTION * 100, pixel_x, pixel_y,
-        )
-        return {
-            "wavelengths_um": [],
-            "flux_per_row": [],
-            "wavelength_range_um": (0.0, 0.0),
-            "total_flux": 0.0,
-            "peak_flux": 0.0,
-            "valid_fraction": valid_fraction,
-            "shape": cut_clean.shape,
-        }
-
-    # Flujo promedio por fila (cada fila = una λ aproximada)
-    flux_per_row = []
-    wave_per_row = []
-    for row_idx in range(cut_clean.shape[0]):
-        row_flux = cut_clean[row_idx]
-        row_wave = cut_wave[row_idx]
-        row_valid = valid_mask[row_idx]
-
-        if not row_valid.any():
-            continue
-
-        flux_avg = float(np.mean(row_flux[row_valid]))
-        wave_avg = float(np.mean(row_wave[row_valid]))
-        flux_per_row.append(flux_avg)
-        wave_per_row.append(wave_avg)
-
-    if not flux_per_row:
-        return {
-            "wavelengths_um": [],
-            "flux_per_row": [],
-            "wavelength_range_um": (0.0, 0.0),
-            "total_flux": 0.0,
-            "peak_flux": 0.0,
-            "valid_fraction": valid_fraction,
-            "shape": cut_clean.shape,
-        }
-
-    wavelengths_um = np.array(wave_per_row, dtype=np.float32)
-    flux_per_row_arr = np.array(flux_per_row, dtype=np.float32)
-
-    # Asegurar orden creciente en λ para el cálculo de pendiente
-    sort_idx = np.argsort(wavelengths_um)
-    wavelengths_um = wavelengths_um[sort_idx]
-    flux_per_row_arr = flux_per_row_arr[sort_idx]
 
     return {
-        "wavelengths_um": wavelengths_um.tolist(),
-        "flux_per_row": flux_per_row_arr.tolist(),
-        "wavelength_range_um": (
-            float(wavelengths_um[0]),
-            float(wavelengths_um[-1]),
-        ),
-        "total_flux": float(flux_per_row_arr.sum()),
-        "peak_flux": float(flux_per_row_arr.max()),
-        "valid_fraction": valid_fraction,
-        "shape": list(cut_clean.shape),
+        "clean": clean[y0:y1, x0:x1],
+        "wave": wave[y0:y1, x0:x1],
+        "var": var[y0:y1, x0:x1] if var is not None else None,
+        "center_x": pixel_x - x0,
+        "center_y": pixel_y - y0,
+        "shape": (y1 - y0, x1 - x0),
+        "edge": (x0 == 0) or (y0 == 0) or (x1 == nx) or (y1 == ny),
     }
 
 
 # --------------------------------------------------------------------------- #
-# Análisis espectral
+# 2. Fotometría de apertura (centrada en el click)
 # --------------------------------------------------------------------------- #
 
-def compute_spectral_slope(
-    wavelengths_um: list[float],
-    flux: list[float],
-) -> float:
+def _aperture_photometry(cut: dict) -> dict:
+    clean = cut["clean"]
+    var = cut["var"]
+    cy, cx = cut["center_y"], cut["center_x"]
+    h, w = clean.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    r2 = (xx - cx) ** 2 + (yy - cy) ** 2
+
+    aperture_mask = r2 <= APERTURE_RADIUS ** 2
+    annulus_mask = (r2 >= ANNULUS_INNER ** 2) & (r2 <= ANNULUS_OUTER ** 2)
+
+    valid = clean != 0
+    ap_valid = aperture_mask & valid
+    ann_valid = annulus_mask & valid
+
+    frac_ap = float(ap_valid.sum() / max(aperture_mask.sum(), 1))
+    frac_ann = float(ann_valid.sum() / max(annulus_mask.sum(), 1))
+
+    if ap_valid.sum() < 3:
+        return {"flux": None, "flux_err": None, "snr": None,
+                "valid_fraction_aperture": frac_ap,
+                "valid_fraction_annulus": frac_ann}
+
+    bkg = float(np.median(clean[ann_valid])) if ann_valid.sum() >= 3 else 0.0
+    flux = float(clean[ap_valid].sum() - bkg * ap_valid.sum())
+
+    if var is not None and np.isfinite(var[ap_valid]).any():
+        var_v = np.where(np.isfinite(var[ap_valid]), var[ap_valid], 0.0)
+        flux_err = float(np.sqrt(var_v.sum()))
+    elif ann_valid.sum() >= 3:
+        sigma = float(np.std(clean[ann_valid]))
+        flux_err = sigma * np.sqrt(ap_valid.sum())
+    else:
+        flux_err = None
+
+    snr = float(flux / flux_err) if flux_err and flux_err > 0 else None
+
+    return {"flux": flux, "flux_err": flux_err, "snr": snr,
+            "valid_fraction_aperture": frac_ap,
+            "valid_fraction_annulus": frac_ann}
+
+
+# --------------------------------------------------------------------------- #
+# 3. Micro-espectro con apertura deslizante
+# --------------------------------------------------------------------------- #
+
+def _spectral_cutout(cut: dict) -> dict:
     """
-    Calcula d log F / d log λ (pendiente en espacio log-log).
-    - Retorna 0.0 si hay <3 puntos o todo el flujo es <=0.
+    Para CADA fila del cutout, mide el flujo en una apertura horizontal de
+    ±APERTURE_RADIUS centrada en X del click. Captura el eje espectral completo
+    del cutout, no solo la apertura centrada.
+
+    Solo conserva filas donde hay señal significativa (flujo > 3σ_bkg).
     """
-    if len(wavelengths_um) < 3 or len(flux) < 3:
-        return 0.0
+    clean = cut["clean"]
+    wave = cut["wave"]
+    var = cut["var"]
+    cy, cx = cut["center_y"], cut["center_x"]
+    h, w = clean.shape
 
-    w = np.array(wavelengths_um, dtype=np.float64)
-    f = np.array(flux, dtype=np.float64)
+    # Perfil del fondo: mediana por fila (fuera de la apertura)
+    wavelengths, fluxes, flux_errs = [], [], []
 
-    # Filtrar λ y F positivos
-    mask = (w > 0) & (f > 0) & np.isfinite(w) & np.isfinite(f)
-    if mask.sum() < 3:
-        return 0.0
+    for row in range(h):
+        # Apertura horizontal centrada en X del click
+        x_lo = max(0, cx - APERTURE_RADIUS)
+        x_hi = min(w, cx + APERTURE_RADIUS + 1)
+        ap_slice = slice(x_lo, x_hi)
 
-    log_w = np.log10(w[mask])
-    log_f = np.log10(f[mask])
+        row_clean = clean[row, ap_slice]
+        row_wave = wave[row, ap_slice]
+        row_valid = (row_clean != 0) & np.isfinite(row_clean)
+        if row_valid.sum() < 2:
+            continue
 
-    # Regresión lineal simple
-    if log_w.std() < 1e-9:
-        return 0.0
+        f = float(np.mean(row_clean[row_valid]))
+        wl = float(np.mean(row_wave[row_valid]))
 
-    slope = float(np.polyfit(log_w, log_f, 1)[0])
-    return slope
+        # Error
+        if var is not None:
+            v = var[row, ap_slice]
+            v = np.where(np.isfinite(v), v, 0.0)
+            ferr = float(np.sqrt(np.mean(v[row_valid])))
+        else:
+            ferr = 0.0
 
+        wavelengths.append(wl)
+        fluxes.append(f)
+        flux_errs.append(ferr)
 
-def classify_from_spectrum(
-    slope: float,
-    total_flux: float,
-    flux_percentile: float,
-    known_objects: list[dict] | None = None,
-) -> str:
-    """
-    Clasificación heurística:
-    - Si hay objetos JPL conocidos → ASTEROID (o STAR si el brillo es enorme).
-    - Si slope < -0.3 → STAR (azul/caliente).
-    - Si slope > 0.2 → ASTEROID (rojizo, típico de asteroides del cinturón).
-    - Otro → UNKNOWN.
+    if not wavelengths:
+        return {"wavelengths": [], "fluxes": [], "flux_errs": []}
 
-    flux_percentile: percentil de total_flux del objeto en el campo
-                     (0=todo negro, 100=la fuente más brillante).
-    """
-    if known_objects:
-        # Si JPL ya lo tiene catalogado, priorizar eso
-        if flux_percentile > 98:
-            return "STAR"  # fuente muy brillante y catalogada
-        return "ASTEROID"
-
-    if flux_percentile < 30:
-        return "UNKNOWN"
-
-    if slope < -0.3:
-        return "STAR"
-    if slope > 0.2:
-        return "ASTEROID"
-    return "UNKNOWN"
+    order = np.argsort(wavelengths)
+    return {
+        "wavelengths": [wavelengths[i] for i in order],
+        "fluxes": [fluxes[i] for i in order],
+        "flux_errs": [flux_errs[i] for i in order],
+    }
 
 
-def estimate_visual_hints(
-    classification: str,
-    slope: float,
-    flux_percentile: float,
+# --------------------------------------------------------------------------- #
+# 4. Color ratio (reemplaza el slope log-log)
+# --------------------------------------------------------------------------- #
+
+def _compute_color_ratio(
+    wavelengths: list[float],
+    fluxes: list[float],
+    flux_errs: list[float],
+    n_extreme: int = 3,
 ) -> dict:
     """
-    Devuelve sugerencias visuales para el visor 3D del frontend.
+    color_ratio = median(F_long) / median(F_short)
+
+    F_short: mediana del flujo en las `n_extreme` filas con menor λ.
+    F_long:  mediana del flujo en las `n_extreme` filas con mayor λ.
+
+    Devuelve ratio, error propagado, rango λ en nm y flag reliable.
     """
-    # Color base: derivado del slope (azul → rojo pasando por blanco)
-    # slope < -0.5 → muy azul
-    # slope  0    → blanco/gris
-    # slope >  0.5 → muy rojo
-    if slope < -0.5:
+    if len(wavelengths) < 2 * n_extreme:
+        return {
+            "color_ratio": None, "color_ratio_err": None,
+            "f_short": None, "f_long": None,
+            "wavelength_range_nm": 0.0, "n_points": 0,
+        }
+
+    w = np.array(wavelengths)
+    f = np.array(fluxes)
+    e = np.array(flux_errs)
+
+    # Ordenar por λ
+    order = np.argsort(w)
+    w, f, e = w[order], f[order], e[order]
+
+    f_short = float(np.median(f[:n_extreme]))
+    f_long = float(np.median(f[-n_extreme:]))
+    e_short = float(np.median(e[:n_extreme]))
+    e_long = float(np.median(e[-n_extreme:]))
+
+    wavelength_range_nm = (w[-1] - w[0]) * 1000.0
+    reliable = wavelength_range_nm >= MIN_WAVELENGTH_RANGE_NM
+
+    if f_short <= 0 or not np.isfinite(f_short):
+        return {
+            "color_ratio": None, "color_ratio_err": None,
+            "f_short": f_short, "f_long": f_long,
+            "wavelength_range_nm": wavelength_range_nm,
+            "n_points": len(w),
+        }
+
+    ratio = f_long / f_short
+    # Error relativo propagado: sqrt((e_long/f_long)^2 + (e_short/f_short)^2)
+    if f_long > 0:
+        rel_err = float(np.sqrt(
+            (e_long / f_long) ** 2 + (e_short / f_short) ** 2
+        ))
+        ratio_err = ratio * rel_err
+    else:
+        ratio_err = None
+
+    return {
+        "color_ratio": float(ratio),
+        "color_ratio_err": ratio_err,
+        "f_short": f_short,
+        "f_long": f_long,
+        "wavelength_range_nm": wavelength_range_nm,
+        "n_points": len(w),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 5. Clasificación con color_ratio
+# --------------------------------------------------------------------------- #
+
+def _classify_color(
+    ratio: float | None,
+    ratio_err: float | None,
+    snr: float | None,
+    reliable: bool,
+) -> tuple[str, float, list[str]]:
+    if not reliable:
+        return "UNKNOWN", 0.0, ["wavelength_range_too_small"]
+    if snr is None or snr < MIN_SNR:
+        return "UNKNOWN", 0.0, ["low_snr"]
+    if ratio is None:
+        return "UNKNOWN", 0.0, ["insufficient_data"]
+
+    # Significancia de |ratio - 1|
+    delta = abs(ratio - 1.0)
+    if ratio_err is not None and ratio_err > 0:
+        significance = delta / ratio_err
+    else:
+        significance = delta / 0.15  # fallback
+
+    if significance < MIN_SIGMA_RATIO:
+        return "UNKNOWN", 0.0, ["color_consistent_with_flat"]
+
+    confidence = float(np.clip((significance - MIN_SIGMA_RATIO) / 3.0, 0.0, 1.0))
+
+    if ratio > 1.0:
+        return "ROCKY_LIKE", confidence, ["red_color"]
+    return "STAR_LIKE", confidence, ["blue_color"]
+
+
+# --------------------------------------------------------------------------- #
+# 6. Visual hints
+# --------------------------------------------------------------------------- #
+
+def _visual_hints(cls: str, ratio: float | None, confidence: float) -> dict:
+    if ratio is None or confidence < 0.2:
+        base_color = "#c8c8c8"
+    elif ratio < 0.7:
         base_color = "#a8c8ff"
-    elif slope < -0.2:
+    elif ratio < 0.9:
         base_color = "#d8e5ff"
-    elif slope < 0.2:
+    elif ratio < 1.1:
         base_color = "#e0e0e0"
-    elif slope < 0.5:
+    elif ratio < 1.4:
         base_color = "#ffd8b8"
     else:
         base_color = "#e8a070"
 
-    if classification == "STAR":
-        return {
-            "base_color_hex": base_color,
-            "roughness": 0.25,
-            "metalness": 0.05,
-            "emissive_intensity": 0.85,
-            "scale_hint": "large",
-            "suggested_3d_model": "star",
-        }
-    if classification == "ASTEROID":
-        return {
-            "base_color_hex": base_color,
-            "roughness": 0.92,
-            "metalness": 0.15,
-            "emissive_intensity": 0.0,
-            "scale_hint": "small",
-            "suggested_3d_model": "rocky",
-        }
-    # UNKNOWN
+    if cls == "STAR_LIKE":
+        return {"base_color_hex": base_color, "roughness": 0.25,
+                "metalness": 0.05, "emissive_intensity": 0.85,
+                "scale_hint": "large", "suggested_3d_model": "star"}
+    if cls == "ROCKY_LIKE":
+        return {"base_color_hex": base_color, "roughness": 0.92,
+                "metalness": 0.15, "emissive_intensity": 0.0,
+                "scale_hint": "small", "suggested_3d_model": "rocky"}
+    return {"base_color_hex": base_color, "roughness": 0.6,
+            "metalness": 0.3, "emissive_intensity": 0.15,
+            "scale_hint": "medium", "suggested_3d_model": "unknown"}
+
+
+# --------------------------------------------------------------------------- #
+# 7. API pública
+# --------------------------------------------------------------------------- #
+
+def analyze_pixel(hdul: fits.HDUList, pixel_x: int, pixel_y: int) -> dict:
+    try:
+        cut = _extract_cutout(hdul, pixel_x, pixel_y)
+    except ValueError as e:
+        logger.info("analyze_pixel cutout failed: %s", e)
+        return _empty_result(str(e))
+
+    photo = _aperture_photometry(cut)
+    spec = _spectral_cutout(cut)
+
+    color = _compute_color_ratio(
+        spec["wavelengths"], spec["fluxes"], spec["flux_errs"]
+    )
+
+    cls, confidence, reasons = _classify_color(
+        color["color_ratio"],
+        color["color_ratio_err"],
+        photo["snr"],
+        color["wavelength_range_nm"] >= MIN_WAVELENGTH_RANGE_NM,
+    )
+
+    # Color index: mapeo lineal de ratio a [-1, +1] centrado en 1.0
+    # ratio=0.5 → +1 (azul), ratio=1.0 → 0 (neutro), ratio=2.0 → -1 (rojo)
+    color_index = None
+    if color["color_ratio"] is not None:
+        ci = (1.0 - color["color_ratio"]) * 2.0
+        color_index = float(np.clip(ci, -1.0, 1.0))
+
+    if spec["wavelengths"]:
+        wmin = float(min(spec["wavelengths"]))
+        wmax = float(max(spec["wavelengths"]))
+    else:
+        wmin = wmax = 0.0
+
     return {
-        "base_color_hex": base_color,
-        "roughness": 0.6,
-        "metalness": 0.3,
-        "emissive_intensity": 0.2,
-        "scale_hint": "medium",
-        "suggested_3d_model": "unknown",
+        "candidate_class": cls,
+        "confidence": round(confidence, 3),
+        "reasons": reasons,
+        "color_ratio": round(color["color_ratio"], 4) if color["color_ratio"] is not None else None,
+        "color_ratio_error": round(color["color_ratio_err"], 4) if color["color_ratio_err"] is not None else None,
+        "color_index": round(color_index, 4) if color_index is not None else None,
+        "f_short": round(color["f_short"], 6) if color["f_short"] is not None else None,
+        "f_long": round(color["f_long"], 6) if color["f_long"] is not None else None,
+        "wavelength_range_um": [wmin, wmax],
+        "wavelength_range_nm": round(color["wavelength_range_nm"], 2),
+        "n_spectral_points": color["n_points"],
+        "reliable": color["wavelength_range_nm"] >= MIN_WAVELENGTH_RANGE_NM,
+        "total_flux": round(photo["flux"], 6) if photo["flux"] is not None else None,
+        "flux_error": round(photo["flux_err"], 6) if photo["flux_err"] is not None else None,
+        "snr": round(photo["snr"], 2) if photo["snr"] is not None else None,
+        "valid_fraction_aperture": round(photo["valid_fraction_aperture"], 3),
+        "valid_fraction_annulus": round(photo["valid_fraction_annulus"], 3),
+        "cutout_edge": cut["edge"],
+        "visual_hints": _visual_hints(cls, color["color_ratio"], confidence),
+        "spectrum_wavelengths": spec["wavelengths"],
+        "spectrum_fluxes": spec["fluxes"],
     }
 
 
-# --------------------------------------------------------------------------- #
-# Función pública
-# --------------------------------------------------------------------------- #
-
-def analyze_pixel(
-    hdul: fits.HDUList,
-    pixel_x: int,
-    pixel_y: int,
-    known_objects: list[dict] | None = None,
-    field_flux_percentiles: tuple[float, float, float] | None = None,
-) -> dict:
-    """
-    Analiza el píxel y devuelve un perfil espectral completo.
-
-    field_flux_percentiles: (p50, p90, p99) del flujo del campo, para
-        clasificar el píxel como "brillante" o "débil". Si es None, se
-        estima rápidamente con el cutout.
-
-    Retorna dict compatible con SpherexProfile (Pydantic).
-    """
-    spectrum = extract_local_spectrum(hdul, pixel_x, pixel_y)
-
-    if not spectrum["flux_per_row"]:
-        return {
-            "classification": "UNKNOWN",
-            "temperature_k": None,
-            "dominant_composition": None,
-            "spectral_slope": 0.0,
-            "color_index": 0.0,
-            "wavelength_range_um": [0.0, 0.0],
-            "total_flux": 0.0,
-            "valid_fraction": spectrum["valid_fraction"],
-            "visual_hints": estimate_visual_hints("UNKNOWN", 0.0, 0.0),
-        }
-
-    slope = compute_spectral_slope(
-        spectrum["wavelengths_um"], spectrum["flux_per_row"]
-    )
-
-    # Percentil aproximado del flujo del píxel dentro del campo.
-    # Sin percentiles del campo, usamos el peak del cutout como proxy.
-    total_flux = spectrum["total_flux"]
-    peak_flux = max(spectrum["peak_flux"], 1e-9)
-    flux_percentile = min(100.0, max(0.0, (total_flux / (peak_flux * 100)) * 100))
-
-    classification = classify_from_spectrum(
-        slope=slope,
-        total_flux=total_flux,
-        flux_percentile=flux_percentile,
-        known_objects=known_objects,
-    )
-
-    # Color index: mapeo del slope a [-1, 1]
-    color_index = float(np.clip(-slope, -1.0, 1.0))
-
+def _empty_result(reason: str) -> dict:
     return {
-        "classification": classification,
-        "temperature_k": None,  # no estimable con un solo detector
-        "dominant_composition": None,  # idem
-        "spectral_slope": round(slope, 4),
-        "color_index": round(color_index, 4),
-        "wavelength_range_um": list(spectrum["wavelength_range_um"]),
-        "total_flux": round(total_flux, 6),
-        "valid_fraction": round(spectrum["valid_fraction"], 3),
-        "visual_hints": estimate_visual_hints(
-            classification, slope, flux_percentile
-        ),
+        "candidate_class": "UNKNOWN",
+        "confidence": 0.0,
+        "reasons": [reason],
+        "color_ratio": None,
+        "color_ratio_error": None,
+        "color_index": None,
+        "f_short": None,
+        "f_long": None,
+        "wavelength_range_um": [0.0, 0.0],
+        "wavelength_range_nm": 0.0,
+        "n_spectral_points": 0,
+        "reliable": False,
+        "total_flux": None,
+        "flux_error": None,
+        "snr": None,
+        "valid_fraction_aperture": 0.0,
+        "valid_fraction_annulus": 0.0,
+        "cutout_edge": False,
+        "visual_hints": _visual_hints("UNKNOWN", None, 0.0),
+        "spectrum_wavelengths": [],
+        "spectrum_fluxes": [],
     }

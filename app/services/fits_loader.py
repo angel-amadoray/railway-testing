@@ -583,3 +583,18 @@ def pixel_to_world(
     wcs = get_spatial_wcs(hdul)
     ra, dec = wcs.all_pix2world(pixel_x, pixel_y, 0)
     return float(ra), float(dec)
+
+def get_variance(hdul: fits.HDUList) -> np.ndarray | None:
+    """
+    Devuelve la extensión VARIANCE como float32 con la misma máscara que
+    get_clean_image. Devuelve None si la extensión no existe.
+    """
+    try:
+        var_hdu = _get_ext(hdul, "VARIANCE")
+        if var_hdu.data is None:
+            return None
+        var = np.array(var_hdu.data, dtype=np.float32, copy=True)
+        var[~np.isfinite(var)] = np.nan
+        return var
+    except KeyError:
+        return None

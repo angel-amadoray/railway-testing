@@ -632,10 +632,6 @@ def spectrum(
     obs_id: str | None = None,
     visit: int | None = None,
 ):
-    """
-    Extrae el micro-espectro local de un píxel (cutout 100×100) y devuelve
-    el perfil espectral interpretado.
-    """
     hotspot = request.app.state.hotspots.get(sector_id)
     if hotspot is None:
         raise HTTPException(404, f"Sector '{sector_id}' not found")
@@ -655,12 +651,15 @@ def spectrum(
     try:
         ny, nx = hdul["IMAGE"].data.shape
         if not (0 <= pixel_x < nx and 0 <= pixel_y < ny):
-            raise HTTPException(400, f"Pixel fuera de imagen {nx}×{ny}")
+            raise HTTPException(400, f"Pixel ({pixel_x},{pixel_y}) fuera de {nx}×{ny}")
 
         result = sa.analyze_pixel(hdul, pixel_x, pixel_y)
-        spectrum_data = sa.extract_local_spectrum(hdul, pixel_x, pixel_y)
     finally:
         hdul.close()
+
+    wavelengths = result.pop("spectrum_wavelengths", [])
+    fluxes = result.pop("spectrum_fluxes", [])
+    profile = SpherexProfile(**result)
 
     return SpectrumResponse(
         sector_id=sector_id,
@@ -668,10 +667,7 @@ def spectrum(
         detector=detector,
         pixel_x=pixel_x,
         pixel_y=pixel_y,
-        wavelengths_um=spectrum_data["wavelengths_um"],
-        flux_per_row=spectrum_data["flux_per_row"],
-        wavelength_range_um=list(spectrum_data["wavelength_range_um"]),
-        total_flux=spectrum_data["total_flux"],
-        valid_fraction=spectrum_data["valid_fraction"],
-        profile=SpherexProfile(**result),
+        wavelengths_um=wavelengths,
+        flux_per_row=fluxes,
+        profile=profile,
     )

@@ -10,16 +10,34 @@ class VisualHints(BaseModel):
     scale_hint: Literal["small", "medium", "large"]
     suggested_3d_model: Literal["rocky", "star", "unknown"]
 
-
 class SpherexProfile(BaseModel):
-    classification: str  # STAR | ASTEROID | UNKNOWN
-    temperature_k: float | None = None
-    dominant_composition: str | None = None
-    spectral_slope: float
-    color_index: float
+    candidate_class: Literal["STAR_LIKE", "ROCKY_LIKE", "UNKNOWN"]
+    confidence: float = 0.0
+    reasons: list[str] = []
+
+    # Color (adimensional, interpretable)
+    color_ratio: float | None = None
+    color_ratio_error: float | None = None
+    color_index: float | None = None
+    f_short: float | None = None
+    f_long: float | None = None
+
+    # Cobertura espectral
     wavelength_range_um: list[float]
-    total_flux: float
-    valid_fraction: float
+    wavelength_range_nm: float = 0.0
+    n_spectral_points: int = 0
+    reliable: bool = False
+
+    # Fotometría de apertura
+    total_flux: float | None = None
+    flux_error: float | None = None
+    snr: float | None = None
+
+    # Calidad
+    valid_fraction_aperture: float = 0.0
+    valid_fraction_annulus: float = 0.0
+    cutout_edge: bool = False
+
     visual_hints: VisualHints
 
 
@@ -31,9 +49,6 @@ class SpectrumResponse(BaseModel):
     pixel_y: int
     wavelengths_um: list[float]
     flux_per_row: list[float]
-    wavelength_range_um: list[float]
-    total_flux: float
-    valid_fraction: float
     profile: SpherexProfile
 
 # for jpl integration

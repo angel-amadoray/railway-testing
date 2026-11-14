@@ -260,6 +260,7 @@ def render_heatmap(
 
     rgb = np.stack([r, g, b], axis=-1)
     rgb_u8 = (np.clip(rgb, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    rgb_u8 = np.flipud(rgb_u8)
     return Image.fromarray(rgb_u8, mode="RGB")
 
 

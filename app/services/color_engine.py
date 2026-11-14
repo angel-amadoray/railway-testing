@@ -175,6 +175,7 @@ def spectral_paint(
 
     rgb = color * brightness[..., np.newaxis]
     rgb_u8 = (rgb * 255.0 + 0.5).astype(np.uint8)
+    rgb_u8 = np.flipud(rgb_u8)
     logger.info("spectral_paint done")
     return Image.fromarray(rgb_u8, mode="RGB")
 
