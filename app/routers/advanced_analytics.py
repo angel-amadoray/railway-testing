@@ -16,7 +16,7 @@ from app.models.advanced import (
 from app.services import advanced_analyzer as aa
 import numpy as np
 from app.services import fits_loader as fl
-from app.services.fits_loader import BAD_BITS, get_spatial_wcs
+from app.services.fits_loader import BAD_BITS, get_spatial_wcs, get_clean_image
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/advanced-analytics", tags=["advanced-analytics"])
@@ -367,12 +367,12 @@ def brightest_valid(
         raise HTTPException(404, f"Missing FITS: {e}")
 
     try:
-        image_s = np.asarray(hdul_s["IMAGE"].data, dtype=np.float32)
+        image_s = get_clean_image(hdul_s, subtract_zodi=True)
         flags_s = hdul_s["FLAGS"].data
         valid_s = (flags_s & BAD_BITS) == 0
         clean_s = np.where(valid_s, image_s, 0.0)
 
-        image_l = np.asarray(hdul_l["IMAGE"].data, dtype=np.float32)
+        image_l = get_clean_image(hdul_l, subtract_zodi=True)
         flags_l = hdul_l["FLAGS"].data
         valid_l = (flags_l & BAD_BITS) == 0
         ny_l, nx_l = image_l.shape
