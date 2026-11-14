@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.core.logging import setup_logging
 from app.models.hotspot import HotspotsCatalog
-from app.routers import debug, hotspots, images, analytics, astrometry
+from app.routers import debug, hotspots, images, analytics, astrometry, advanced_analytics
 
 logger = logging.getLogger(__name__)
 
@@ -63,5 +63,6 @@ def health():
 app.include_router(hotspots.router, prefix="/api")
 app.include_router(images.router, prefix="/api")
 app.include_router(analytics.router, prefix="/api")
+app.include_router(advanced_analytics.router, prefix="/api")
 app.include_router(astrometry.router, prefix="/api")
 app.include_router(debug.router, prefix="/api")
