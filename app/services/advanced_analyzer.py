@@ -1,26 +1,26 @@
 """
-Análisis multi-detector de SPHEREx — pares de telescopio.
+SPHEREx multi-detector analysis — telescope pairs.
 
-SPHEREx tiene 3 telescopios físicamente separados por ~3.9° en RA.
-Cada telescopio lleva 2 detectores LVF:
+SPHEREx has 3 telescopes physically separated by ~3.9° in RA.
+Each telescope carries 2 LVF detectors:
 
-    Telescopio 1: D1 (0.75-1.09 μm) + D4 (2.42-3.82 μm)
-    Telescopio 2: D2 (1.10-1.62 μm) + D5 (3.83-4.41 μm)
-    Telescopio 3: D3 (1.63-2.41 μm) + D6 (4.42-5.00 μm)
+    Telescope 1: D1 (0.75-1.09 μm) + D4 (2.42-3.82 μm)
+    Telescope 2: D2 (1.10-1.62 μm) + D5 (3.83-4.41 μm)
+    Telescope 3: D3 (1.63-2.41 μm) + D6 (4.42-5.00 μm)
 
-Un objeto en el cielo es visto por UN SOLO telescopio por visita.
-Por lo tanto, con una sola visita, el máximo de información espectral
-por objeto son 2 puntos (los 2 detectores del telescopio que lo cubre).
+An object in the sky is seen by only ONE telescope per visit.
+Therefore, in a single visit, the maximum spectral information
+per object is 2 points (the 2 detectors of the telescope covering it).
 
 Pipeline:
-  1. Detectar qué par (D1+D4, D2+D5, D3+D6) cubre el (RA, Dec).
-  2. Fotometría de apertura en ambos detectores → 2 flujos.
-  3. Ratio = F(long) / F(short) con error propagado.
-  4. Clasificar:
-     - ratio < 0.7  → ABSORPTION fuerte (hielo si par=D1+D4)
-     - ratio < 0.9  → ABSORPTION débil
-     - 0.9..1.1     → CONTINUUM (probable estrella)
-     - > 1.1        → EMISSION (polvo caliente)
+  1. Detect which pair (D1+D4, D2+D5, D3+D6) covers the (RA, Dec).
+  2. Aperture photometry in both detectors → 2 fluxes.
+  3. Ratio = F(long) / F(short) with propagated error.
+  4. Classify:
+     - ratio < 0.7  → strong ABSORPTION (ice if pair=D1+D4)
+     - ratio < 0.9  → weak ABSORPTION
+     - 0.9..1.1     → CONTINUUM (likely star)
+     - > 1.1        → EMISSION (hot dust)
      - snr < 3      → UNDETERMINED
 """
 
@@ -46,28 +46,28 @@ from app.services.spectral_analyzer import (
 
 logger = logging.getLogger(__name__)
 
-# Pares de telescopio: (detector_short, detector_long)
+# Telescope pairs: (detector_short, detector_long)
 TELESCOPE_PAIRS = [
     (1, 4),
     (2, 5),
     (3, 6),
 ]
 
-# Clasificaciones basadas en la forma del SED (2 puntos), no en absorción:
-STEEP_RED = 0.7       # ratio < 0.7 → caída pronunciada hacia λ largas
-MODERATE_RED = 0.9    # 0.7-0.9 → caída moderada
-FLAT_MAX = 1.1        # 0.9-1.1 → plano
+# Classifications based on SED shape (2 points), not absorption:
+STEEP_RED = 0.7       # ratio < 0.7 → steep drop toward long λ
+MODERATE_RED = 0.9    # 0.7-0.9 → moderate drop
+FLAT_MAX = 1.1        # 0.9-1.1 → flat
 MIN_SNR = 3.0
 MIN_RATIO_SIGNIFICANCE = 2.0  # |ratio - 1| / sigma_ratio
 _HC_K = 14387.77  # μm·K
 
 # --------------------------------------------------------------------------- #
-# Utilidades ratios
+# Ratio utilities
 # --------------------------------------------------------------------------- #
 
 def _bb_fnu_ratio(T: float, lam_s: float, lam_l: float) -> float:
     """
-    Ratio F_ν(long)/F_ν(short) para un cuerpo negro a temperatura T.
+    F_ν(long)/F_ν(short) ratio for a blackbody at temperature T.
 
     B_ν(λ, T) ∝ (1/λ³) / (e^(hc/λkT) - 1)
     """
@@ -75,7 +75,7 @@ def _bb_fnu_ratio(T: float, lam_s: float, lam_l: float) -> float:
         return 0.0
     xs = _HC_K / (lam_s * T)
     xl = _HC_K / (lam_l * T)
-    if xs > 700 or xl > 700:  # evita overflow
+    if xs > 700 or xl > 700:  # avoid overflow
         return 0.0
     return float((lam_s / lam_l) ** 3 * (np.expm1(xs) / np.expm1(xl)))
 
@@ -85,7 +85,7 @@ def _color_temperature(
     lam_s: float | None,
     lam_l: float | None,
 ) -> float | None:
-    """Invierte el ratio observado asumiendo cuerpo negro. None si no converge."""
+    """Invert the observed ratio assuming a blackbody. None if it does not converge."""
     if ratio is None or lam_s is None or lam_l is None:
         return None
     if ratio <= 0 or lam_s <= 0 or lam_l <= 0 or lam_l <= lam_s:
@@ -95,37 +95,37 @@ def _color_temperature(
         return _bb_fnu_ratio(T, lam_s, lam_l) - ratio
 
     try:
-        # f(500K) > 0 (frío = ratio alto), f(30000K) < 0 (caliente = ratio bajo)
+        # f(500K) > 0 (cold = high ratio), f(30000K) < 0 (hot = low ratio)
         f_lo = f(500.0)
         f_hi = f(30000.0)
         if f_lo * f_hi > 0:
-            return None  # fuera de rango
+            return None  # out of range
         return float(brentq(f, 500.0, 30000.0, maxiter=100))
     except (ValueError, RuntimeError):
         return None
 
 # --------------------------------------------------------------------------- #
-# Utilidades geométricas
+# Geometric utilities
 # --------------------------------------------------------------------------- #
 
 def _pixel_for_world(hdul: fits.HDUList, ra_deg: float, dec_deg: float):
     """
-    Convierte RA/Dec → (x, y) usando el WCS espacial.
+    Convert RA/Dec → (x, y) using the spatial WCS.
 
-    Estrategia:
-      1. Intentar `all_world2pix` (SIP iterativo, preciso cerca del centro).
-      2. Si falla por divergencia, usar `wcs_world2pix` (una pasada, no diverge).
-      3. Normalizar SIEMPRE el output a float (varía por versión de Astropy).
-      4. Devolver None si cae fuera del frame.
+    Strategy:
+      1. Try `all_world2pix` (iterative SIP, accurate near the center).
+      2. If it fails due to divergence, use `wcs_world2pix` (one pass, does not diverge).
+      3. ALWAYS normalize the output to float (varies by Astropy version).
+      4. Return None if it falls outside the frame.
 
-    Devuelve (x, y) enteros o None.
+    Return integer (x, y) or None.
     """
     wcs = get_spatial_wcs(hdul)
 
     x = y = None
 
     def _to_float(value) -> float | None:
-        """Convierte scalar, array([v]) o array([[v]]) a float. None si falla."""
+        """Convert a scalar, array([v]), or array([[v]]) to float. None on failure."""
         try:
             arr = np.asarray(value, dtype=np.float64).ravel()
             if arr.size < 1 or not np.isfinite(arr[0]):
@@ -134,10 +134,10 @@ def _pixel_for_world(hdul: fits.HDUList, ra_deg: float, dec_deg: float):
         except Exception:
             return None
 
-    # Intento 1: iterativo (mejor precisión con SIP)
+    # Attempt 1: iterative (better precision with SIP)
     try:
         raw = wcs.all_world2pix(ra_deg, dec_deg, 0)
-        # raw puede ser tuple, ndarray (2,), o ndarray (1,2)
+        # raw may be a tuple, ndarray (2,), or ndarray (1,2)
         raw_arr = np.asarray(raw, dtype=np.float64).ravel()
         if raw_arr.size >= 2:
             x = float(raw_arr[0])
@@ -145,7 +145,7 @@ def _pixel_for_world(hdul: fits.HDUList, ra_deg: float, dec_deg: float):
     except Exception as e:
         logger.info("all_world2pix failed (%s); falling back", e)
 
-    # Intento 2: directo (no diverge)
+    # Attempt 2: direct (does not diverge)
     if x is None or y is None or not (np.isfinite(x) and np.isfinite(y)):
         try:
             raw = wcs.wcs_world2pix([[ra_deg, dec_deg]], 0)
@@ -172,7 +172,7 @@ def _pixel_for_world(hdul: fits.HDUList, ra_deg: float, dec_deg: float):
 
 
 def _effective_wavelength_range(detector: int) -> tuple[float, float]:
-    """Rango λ oficial del detector (μm)."""
+    """Official detector λ range (μm)."""
     return DETECTOR_WAVELENGTH_RANGES.get(detector, (0.0, 0.0))
 
 
@@ -182,7 +182,7 @@ def _center_wavelength(detector: int) -> float:
 
 
 # --------------------------------------------------------------------------- #
-# Detección del par que cubre el RA/Dec
+# Detect the pair covering the RA/Dec
 # --------------------------------------------------------------------------- #
 
 def detect_covering_pair(
@@ -194,11 +194,11 @@ def detect_covering_pair(
     visit: int | None = None,
 ) -> tuple[int, int] | None:
     """
-    Devuelve el par (det_short, det_long) que cubre el RA/Dec, o None
-    si ninguno lo cubre. Requiere que al menos uno de los dos detectores
-    del par tenga el punto dentro del frame.
+    Return the pair (det_short, det_long) covering the RA/Dec, or None
+    if neither covers it. Requires at least one of the pair's two detectors
+    to have the point inside the frame.
 
-    No verifica si AMBOS están dentro; eso lo hace extract_pair_flux.
+    Does not check whether BOTH are inside; extract_pair_flux does that.
     """
     for pair in TELESCOPE_PAIRS:
         for det in pair:
@@ -219,11 +219,11 @@ def detect_covering_pair(
 
 
 # --------------------------------------------------------------------------- #
-# Fotometría en un detector
+# Photometry on a detector
 # --------------------------------------------------------------------------- #
 
 def _pixel_wavelength(hdul, x: int, y: int) -> tuple[float | None, float | None]:
-    """Devuelve (λ_μm, Δλ_μm) del píxel (x, y) usando el WCS espectral."""
+    """Return (λ_μm, Δλ_μm) for pixel (x, y) using the spectral WCS."""
     try:
         wcs = get_spectral_wcs(hdul)
         world = wcs.pixel_to_world(float(x), float(y))
@@ -246,9 +246,9 @@ def _photometry_detector(
     visit: int | None,
 ) -> dict:
     """
-    Extrae flux, error, S/N y posición para un detector en concreto.
+    Extract flux, error, S/N, and position for a specific detector.
 
-    Devuelve dict con:
+    Return a dict with:
         available: bool
         detector, pixel_x, pixel_y
         flux, flux_err, snr
@@ -307,11 +307,11 @@ def _photometry_detector(
 
 
 # --------------------------------------------------------------------------- #
-# Cálculo del ratio y clasificación
+# Ratio calculation and classification
 # --------------------------------------------------------------------------- #
 
 def _compute_ratio(short: dict, long: dict) -> tuple[float | None, float | None]:
-    """Devuelve (ratio, ratio_err). None si falta algún flujo."""
+    """Return (ratio, ratio_err). None if any flux is missing."""
     fs = short.get("flux")
     fl = long.get("flux")
     es = short.get("flux_err")
@@ -344,9 +344,9 @@ def classify_pair(
     valid_short: float = 1.0,
     valid_long: float = 1.0,
 ) -> dict:
-    """Clasifica a partir de la temperatura de color derivada del ratio."""
+    """Classify based on the color temperature derived from the ratio."""
 
-    # --- Guardas ---
+    # --- Guards ---
     if valid_short < 0.1:
         return _undet(f"D{pair[0]} aperture is masked.")
     if valid_long < 0.1:
@@ -362,13 +362,13 @@ def classify_pair(
     if ratio is None:
         return _undet("Ratio could not be computed.")
 
-    # --- Temperatura de color ---
+    # --- Color temperature ---
     T = _color_temperature(ratio, lam_short, lam_long)
 
-    # Error de T propagado
+    # Propagated T error
     T_err = None
     if T is not None and ratio_err is not None and ratio_err > 0 and lam_short and lam_long:
-        # dT/dratio via diferencias finitas
+        # dT/dratio via finite differences
         eps = max(ratio * 0.01, 0.005)
         T_hi = _color_temperature(ratio + eps, lam_short, lam_long)
         T_lo = _color_temperature(max(ratio - eps, 0.01), lam_short, lam_long)
@@ -389,7 +389,7 @@ def classify_pair(
             "color_temperature_err_k": None,
         }
 
-    # --- Clasificación por T ---
+    # --- Classification by T ---
     if T > 10000:
         cls, label, conf = "HOT_STAR", "Estrella caliente (O/B/A)", 0.7
     elif T > 5500:
@@ -433,7 +433,7 @@ def _undet(reason: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# API pública
+# Public API
 # --------------------------------------------------------------------------- #
 
 def analyze_pair(
@@ -445,9 +445,9 @@ def analyze_pair(
     visit: int | None = None,
 ) -> dict:
     """
-    Pipeline completo para un (RA, Dec).
+    Complete pipeline for an (RA, Dec).
 
-    Devuelve dict compatible con PairSpectrumResponse.
+    Return a dict compatible with PairSpectrumResponse.
     """
     pair = detect_covering_pair(
         sector_id=sector_id,

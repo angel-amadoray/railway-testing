@@ -1,23 +1,23 @@
 """
-Análisis espectral local de un píxel de SPHEREx (Level 2, un solo detector).
+Local spectral analysis of a SPHEREx pixel (Level 2, single detector).
 
-IMPORTANTE — limitaciones físicas:
-  - Un exposure contiene UNA λ por píxel. Con un solo detector, una fuente
-    puntual ocupa solo ~5-10 filas → 1-3 nm de rango espectral efectivo.
-  - Esto es insuficiente para medir temperatura, composición o espectro real.
-  - Solo se puede medir "color": F(λ_larga) / F(λ_corta).
-  - La clasificación es un CANDIDATO estadístico, no una identificación.
-    STAR_LIKE  → color_ratio < 0.85 (más flujo a λ cortas = más azul)
-    ROCKY_LIKE → color_ratio > 1.15 (más flujo a λ largas = más rojo)
-    UNKNOWN    → plano, ruido, o rango espectral insuficiente
+IMPORTANT — physical limitations:
+  - An exposure contains ONE λ per pixel. With a single detector, a point
+    source occupies only ~5-10 rows → 1-3 nm of effective spectral range.
+  - This is insufficient to measure temperature, composition, or a true spectrum.
+  - Only "color" can be measured: F(λ_long) / F(λ_short).
+  - The classification is a statistical CANDIDATE, not an identification.
+    STAR_LIKE  → color_ratio < 0.85 (more flux at short λ = bluer)
+    ROCKY_LIKE → color_ratio > 1.15 (more flux at long λ = redder)
+    UNKNOWN    → flat, noisy, or insufficient spectral range
 
 Pipeline:
-  1. Recorte 60×60 alrededor del click.
-  2. Fotometría de apertura: flux en radio 5 px, fondo en anillo 8-15 px.
-  3. Micro-espectro: apertura deslizante en cada fila con flujo > umbral.
-  4. Color ratio: F_long / F_short en las filas extremas de λ.
-  5. Significancia del ratio propagando errores (VARIANCE).
-  6. Solo clasificar si |ratio - 1| > 1.5σ_ratio.
+  1. 60×60 cutout around the click.
+  2. Aperture photometry: flux within a 5 px radius, background in an 8-15 px annulus.
+  3. Micro-spectrum: sliding aperture on each row with flux above the threshold.
+  4. Color ratio: F_long / F_short on the extreme λ rows.
+  5. Ratio significance with propagated errors (VARIANCE).
+  6. Classify only if |ratio - 1| > 1.5σ_ratio.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from app.services.fits_loader import (
 
 logger = logging.getLogger(__name__)
 
-# --- Configuración ---
+# --- Configuration ---
 CUTOUT_SIZE = 60
 APERTURE_RADIUS = 5
 ANNULUS_INNER = 8
@@ -46,29 +46,27 @@ MIN_WAVELENGTH_RANGE_NM = 3.0
 
 
 # --------------------------------------------------------------------------- #
-# 1. Recorte
+# 1. Cutout
 # --------------------------------------------------------------------------- #
 
 def _extract_cutout(hdul: fits.HDUList, pixel_x: int, pixel_y: int) -> dict:
-    """Extrae el recorte de análisis alrededor de un píxel seleccionado.
+    """Extract the analysis cutout around a selected pixel.
 
-    Carga la imagen limpia, el mapa de longitudes de onda y la varianza, y los
-    recorta al área ``CUTOUT_SIZE`` centrada en la posición indicada. Ajusta el
-    recorte cuando está cerca del borde y registra si toca el límite del
-    detector.
+    Load the clean image, wavelength map, and variance, and crop them to the
+    ``CUTOUT_SIZE`` area centered on the indicated position. Adjust the cutout
+    near the edge and record whether it touches the detector boundary.
 
     Args:
-        hdul: Archivo FITS abierto de un detector SPHEREx.
-        pixel_x: Coordenada X del píxel seleccionado.
-        pixel_y: Coordenada Y del píxel seleccionado.
+        hdul: Open FITS file from a SPHEREx detector.
+        pixel_x: X coordinate of the selected pixel.
+        pixel_y: Y coordinate of the selected pixel.
 
     Returns:
-        Diccionario con ``clean``, ``wave``, ``var``, centro local, forma y
-        bandera de borde.
+        Dictionary with ``clean``, ``wave``, ``var``, local center, shape, and
+        edge flag.
 
     Raises:
-        ValueError: Si el recorte resultante es demasiado pequeño para la
-            apertura fotométrica.
+        ValueError: If the resulting cutout is too small for aperture photometry.
     """
     clean = get_clean_image(hdul, subtract_zodi=True)
     wave = get_wavelength_map(hdul, downsample=4)
@@ -99,23 +97,23 @@ def _extract_cutout(hdul: fits.HDUList, pixel_x: int, pixel_y: int) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# 2. Fotometría de apertura (centrada en el click)
+# 2. Aperture photometry (centered on the click)
 # --------------------------------------------------------------------------- #
 
 def _aperture_photometry(cut: dict) -> dict:
-    """Calcula fotometría de apertura y relación señal/ruido.
+    """Calculate aperture photometry and signal-to-noise ratio.
 
-    Suma el flujo dentro de una apertura circular, estima el fondo con un
-    anillo concéntrico y lo sustrae. El error se obtiene de ``VARIANCE`` cuando
-    existe; si no, se estima con la desviación del anillo.
+    Sum the flux within a circular aperture, estimate the background with a
+    concentric annulus, and subtract it. Obtain the error from ``VARIANCE``
+    when available; otherwise estimate it from the annulus deviation.
 
     Args:
-        cut: Diccionario producido por ``_extract_cutout``.
+        cut: Dictionary produced by ``_extract_cutout``.
 
     Returns:
-        Diccionario con flujo, error, SNR y fracciones válidas de apertura y
-        anillo. Si hay menos de tres píxeles válidos en la apertura, las
-        medidas fotométricas se devuelven como ``None``.
+        Dictionary with flux, error, SNR, and valid aperture and annulus
+        fractions. If fewer than three valid pixels exist in the aperture,
+        photometric measurements are returned as ``None``.
     """
     clean = cut["clean"]
     var = cut["var"]
@@ -159,24 +157,24 @@ def _aperture_photometry(cut: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# 3. Micro-espectro con apertura deslizante
+# 3. Micro-spectrum with sliding aperture
 # --------------------------------------------------------------------------- #
 
 def _spectral_cutout(cut: dict) -> dict:
     """
-    Construye un micro-espectro recorriendo todas las filas del recorte.
+    Build a micro-spectrum by traversing all rows of the cutout.
 
-    En cada fila mide la media del flujo en una apertura horizontal centrada en
-    X del clic. Calcula la longitud de onda media y, si existe, el error a partir
-    de ``VARIANCE``. Omite filas con menos de dos píxeles válidos y ordena los
-    puntos finales por longitud de onda.
+    On each row, measure the mean flux in a horizontal aperture centered on the
+    click's X coordinate. Calculate the mean wavelength and, when available,
+    the error from ``VARIANCE``. Skip rows with fewer than two valid pixels and
+    sort the final points by wavelength.
 
     Args:
-        cut: Diccionario producido por ``_extract_cutout``.
+        cut: Dictionary produced by ``_extract_cutout``.
 
     Returns:
-        Diccionario con listas ordenadas de ``wavelengths``, ``fluxes`` y
-        ``flux_errs``. Si no hay filas válidas, las tres listas quedan vacías.
+        Dictionary with sorted lists of ``wavelengths``, ``fluxes``, and
+        ``flux_errs``. If no valid rows exist, all three lists are empty.
     """
     clean = cut["clean"]
     wave = cut["wave"]
@@ -184,11 +182,11 @@ def _spectral_cutout(cut: dict) -> dict:
     cy, cx = cut["center_y"], cut["center_x"]
     h, w = clean.shape
 
-    # Perfil del fondo: mediana por fila (fuera de la apertura)
+    # Background profile: median per row (outside the aperture)
     wavelengths, fluxes, flux_errs = [], [], []
 
     for row in range(h):
-        # Apertura horizontal centrada en X del click
+        # Horizontal aperture centered on the click's X coordinate
         x_lo = max(0, cx - APERTURE_RADIUS)
         x_hi = min(w, cx + APERTURE_RADIUS + 1)
         ap_slice = slice(x_lo, x_hi)
@@ -226,7 +224,7 @@ def _spectral_cutout(cut: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# 4. Color ratio (reemplaza el slope log-log)
+    # 4. Color ratio (replaces the log-log slope)
 # --------------------------------------------------------------------------- #
 
 def _compute_color_ratio(
@@ -236,22 +234,22 @@ def _compute_color_ratio(
     n_extreme: int = 3,
 ) -> dict:
     """
-    Calcula el índice de color como ``median(F_long) / median(F_short)``.
+    Calculate the color index as ``median(F_long) / median(F_short)``.
 
-    ``F_short`` usa las filas con menor longitud de onda y ``F_long`` las de
-    mayor longitud de onda. También propaga los errores medianos, informa el
-    rango espectral en nanómetros y conserva el número de puntos disponibles.
+    ``F_short`` uses the rows with the shortest wavelengths and ``F_long`` those
+    with the longest wavelengths. Also propagate median errors, report the
+    spectral range in nanometers, and preserve the number of available points.
 
     Args:
-        wavelengths: Longitudes de onda de los puntos del micro-espectro, en μm.
-        fluxes: Flujos correspondientes a cada longitud de onda.
-        flux_errs: Errores de flujo correspondientes.
-        n_extreme: Cantidad de puntos extremos usados por cada lado.
+        wavelengths: Wavelengths of the micro-spectrum points, in μm.
+        fluxes: Fluxes corresponding to each wavelength.
+        flux_errs: Corresponding flux errors.
+        n_extreme: Number of extreme points used on each side.
 
     Returns:
-        Diccionario con ratio, error, flujos corto/largo, rango en nm y número
-        de puntos. El ratio es ``None`` si faltan puntos o el flujo corto no es
-        positivo.
+        Dictionary with ratio, error, short/long fluxes, range in nm, and point
+        count. The ratio is ``None`` if points are missing or short flux is not
+        positive.
     """
     if len(wavelengths) < 2 * n_extreme:
         return {
@@ -264,7 +262,7 @@ def _compute_color_ratio(
     f = np.array(fluxes)
     e = np.array(flux_errs)
 
-    # Ordenar por λ
+    # Sort by λ
     order = np.argsort(w)
     w, f, e = w[order], f[order], e[order]
 
@@ -285,7 +283,7 @@ def _compute_color_ratio(
         }
 
     ratio = f_long / f_short
-    # Error relativo propagado: sqrt((e_long/f_long)^2 + (e_short/f_short)^2)
+    # Propagated relative error: sqrt((e_long/f_long)^2 + (e_short/f_short)^2)
     if f_long > 0:
         rel_err = float(np.sqrt(
             (e_long / f_long) ** 2 + (e_short / f_short) ** 2
@@ -305,7 +303,7 @@ def _compute_color_ratio(
 
 
 # --------------------------------------------------------------------------- #
-# 5. Clasificación con color_ratio
+# 5. Classification with color_ratio
 # --------------------------------------------------------------------------- #
 
 def _classify_color(
@@ -314,21 +312,21 @@ def _classify_color(
     snr: float | None,
     reliable: bool,
 ) -> tuple[str, float, list[str]]:
-    """Clasifica estadísticamente el candidato usando color y calidad de señal.
+    """Statistically classify the candidate using color and signal quality.
 
-    Rechaza resultados con rango espectral insuficiente, SNR bajo o datos
-    incompletos. Para resultados válidos compara la desviación del ratio
-    respecto a 1 con ``ratio_err`` y devuelve ``STAR_LIKE`` para color azul o
-    ``ROCKY_LIKE`` para color rojo.
+    Reject results with insufficient spectral range, low SNR, or incomplete
+    data. For valid results, compare the ratio's deviation from 1 with
+    ``ratio_err`` and return ``STAR_LIKE`` for blue color or ``ROCKY_LIKE`` for
+    red color.
 
     Args:
-        ratio: Ratio de flujo largo/corto.
-        ratio_err: Error estimado del ratio.
-        snr: Relación señal/ruido fotométrica.
-        reliable: Indica si el rango espectral mínimo está cubierto.
+        ratio: Long-to-short flux ratio.
+        ratio_err: Estimated ratio error.
+        snr: Photometric signal-to-noise ratio.
+        reliable: Whether the minimum spectral range is covered.
 
     Returns:
-        Tupla con clase, confianza entre 0 y 1 y lista de razones.
+        Tuple with class, confidence between 0 and 1, and a list of reasons.
     """
     if not reliable:
         return "UNKNOWN", 0.0, ["wavelength_range_too_small"]
@@ -337,7 +335,7 @@ def _classify_color(
     if ratio is None:
         return "UNKNOWN", 0.0, ["insufficient_data"]
 
-    # Significancia de |ratio - 1|
+    # Significance of |ratio - 1|
     delta = abs(ratio - 1.0)
     if ratio_err is not None and ratio_err > 0:
         significance = delta / ratio_err
@@ -359,19 +357,19 @@ def _classify_color(
 # --------------------------------------------------------------------------- #
 
 def _visual_hints(cls: str, ratio: float | None, confidence: float) -> dict:
-    """Genera parámetros visuales orientativos para representar el candidato.
+    """Generate indicative visual parameters for representing the candidate.
 
-    Elige un color base según el ratio y reduce la confianza visual cuando la
-    evidencia es débil. Después asigna rugosidad, metalicidad, emisión, escala
-    y modelo sugerido según la clase estadística.
+    Choose a base color according to the ratio and reduce visual confidence
+    when evidence is weak. Then assign roughness, metalness, emission, scale,
+    and a suggested model according to the statistical class.
 
     Args:
-        cls: Clase ``STAR_LIKE``, ``ROCKY_LIKE`` o ``UNKNOWN``.
-        ratio: Ratio de color, si está disponible.
-        confidence: Confianza de la clasificación.
+        cls: ``STAR_LIKE``, ``ROCKY_LIKE``, or ``UNKNOWN`` class.
+        ratio: Color ratio, if available.
+        confidence: Classification confidence.
 
     Returns:
-        Diccionario de sugerencias de material y modelo 3D.
+        Dictionary of material and 3D model suggestions.
     """
     if ratio is None or confidence < 0.2:
         base_color = "#c8c8c8"
@@ -400,24 +398,24 @@ def _visual_hints(cls: str, ratio: float | None, confidence: float) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# 7. API pública
+# 7. Public API
 # --------------------------------------------------------------------------- #
 
 def analyze_pixel(hdul: fits.HDUList, pixel_x: int, pixel_y: int) -> dict:
-    """Ejecuta el análisis fotométrico y espectral completo de un píxel.
+    """Run the complete photometric and spectral analysis of a pixel.
 
-    Combina recorte, fotometría de apertura, micro-espectro, ratio de color,
-    clasificación estadística e indicaciones visuales. Si el píxel está
-    demasiado cerca del borde, devuelve una respuesta vacía con la razón.
+    Combine cutout extraction, aperture photometry, micro-spectrum, color ratio,
+    statistical classification, and visual hints. If the pixel is too close to
+    the edge, return an empty response with the reason.
 
     Args:
-        hdul: Archivo FITS abierto.
-        pixel_x: Coordenada X del píxel seleccionado.
-        pixel_y: Coordenada Y del píxel seleccionado.
+        hdul: Open FITS file.
+        pixel_x: X coordinate of the selected pixel.
+        pixel_y: Y coordinate of the selected pixel.
 
     Returns:
-        Diccionario con clase candidata, confianza, color, flujo, SNR, rango
-        espectral, puntos del espectro y sugerencias visuales.
+        Dictionary with candidate class, confidence, color, flux, SNR, spectral
+        range, spectrum points, and visual suggestions.
     """
     try:
         cut = _extract_cutout(hdul, pixel_x, pixel_y)
@@ -439,8 +437,8 @@ def analyze_pixel(hdul: fits.HDUList, pixel_x: int, pixel_y: int) -> dict:
         color["wavelength_range_nm"] >= MIN_WAVELENGTH_RANGE_NM,
     )
 
-    # Color index: mapeo lineal de ratio a [-1, +1] centrado en 1.0
-    # ratio=0.5 → +1 (azul), ratio=1.0 → 0 (neutro), ratio=2.0 → -1 (rojo)
+    # Color index: linear mapping of ratio to [-1, +1] centered at 1.0
+    # ratio=0.5 → +1 (blue), ratio=1.0 → 0 (neutral), ratio=2.0 → -1 (red)
     color_index = None
     if color["color_ratio"] is not None:
         ci = (1.0 - color["color_ratio"]) * 2.0
@@ -478,14 +476,14 @@ def analyze_pixel(hdul: fits.HDUList, pixel_x: int, pixel_y: int) -> dict:
 
 
 def _empty_result(reason: str) -> dict:
-    """Construye una respuesta estándar cuando no puede completarse el análisis.
+    """Build a standard response when the analysis cannot be completed.
 
     Args:
-        reason: Motivo que se incluirá en la lista de razones del resultado.
+        reason: Reason to include in the result's reasons list.
 
     Returns:
-        Diccionario con la misma estructura que ``analyze_pixel``, pero con
-        valores nulos, listas vacías y clase ``UNKNOWN``.
+        Dictionary with the same structure as ``analyze_pixel``, but with null
+        values, empty lists, and the ``UNKNOWN`` class.
     """
     return {
         "candidate_class": "UNKNOWN",

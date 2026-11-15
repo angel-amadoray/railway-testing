@@ -1,16 +1,16 @@
 """
-Motor de color para visualización de imágenes espectrales SPHEREx.
+Color engine for visualizing SPHEREx spectral images.
 
-Estrategia "spectral paint":
-- Brillo = flujo (IMAGE - ZODI), con stretch arcsinh
-- Color = λ del píxel (WCS-WAVE)
+"spectral paint" strategy:
+- Brightness = flux (IMAGE - ZODI), with arcsinh stretch
+- Color = pixel λ (WCS-WAVE)
 
-Modos de normalización:
-- "per_row": cada fila (≈ una λ) se normaliza con sus propios percentiles.
-            Elimina el gradiente de fondo instrumental/zodiacal y permite
-            ver estructura a TODAS las λ. Recomendado.
-- "global":  percentiles globales (versión original). Solo útil si el
-            gradiente de fondo es despreciable.
+Normalization modes:
+- "per_row": each row (≈ one λ) is normalized using its own percentiles.
+            Removes the instrumental/zodiacal background gradient and allows
+            structure to be seen at ALL λ. Recommended.
+- "global":  global percentiles (original version). Useful only if the
+            background gradient is negligible.
 """
 
 from __future__ import annotations
@@ -32,36 +32,36 @@ from app.services.fits_loader import (
 logger = logging.getLogger(__name__)
 
 _COLORMAP_ANCHORS = [
-    (0.00, (0.20, 0.00, 0.55)),  # violeta
-    (0.20, (0.00, 0.25, 1.00)),  # azul
-    (0.40, (0.00, 0.90, 1.00)),  # cian
-    (0.60, (0.30, 1.00, 0.00)),  # verde
-    (0.80, (1.00, 0.90, 0.00)),  # amarillo
-    (1.00, (1.00, 0.15, 0.00)),  # rojo
+    (0.00, (0.20, 0.00, 0.55)),  # violet
+    (0.20, (0.00, 0.25, 1.00)),  # blue
+    (0.40, (0.00, 0.90, 1.00)),  # cyan
+    (0.60, (0.30, 1.00, 0.00)),  # green
+    (0.80, (1.00, 0.90, 0.00)),  # yellow
+    (1.00, (1.00, 0.15, 0.00)),  # red
 ]
 _POSITIONS = np.array([p for p, _ in _COLORMAP_ANCHORS], dtype=np.float32)
 _COLORS = np.array([c for _, c in _COLORMAP_ANCHORS], dtype=np.float32)
 
 
 # --------------------------------------------------------------------------- #
-# Stretch y normalización
+# Stretch and normalization
 # --------------------------------------------------------------------------- #
 
 def normalize_percentile(data, p_low=1.0, p_high=99.5):
-    """Normaliza una matriz al intervalo ``[0, 1]`` mediante percentiles.
+    """Normalize an array to the ``[0, 1]`` interval using percentiles.
 
-    Ignora valores no finitos y ceros al calcular los límites inferior y
-    superior, pero conserva la forma original de la matriz en el resultado.
-    Los valores fuera del rango calculado se recortan a ``[0, 1]``. Si no hay
-    datos válidos, devuelve una matriz de ceros de tipo ``float32``.
+    Ignore non-finite values and zeros when calculating the lower and upper
+    bounds, while preserving the original array shape in the result.
+    Values outside the calculated range are clipped to ``[0, 1]``. If there
+    is no valid data, return an array of zeros with type ``float32``.
 
     Args:
-        data: Matriz numérica cuyos valores se desean normalizar.
-        p_low: Percentil usado como límite inferior.
-        p_high: Percentil usado como límite superior.
+        data: Numeric array whose values are to be normalized.
+        p_low: Percentile used as the lower bound.
+        p_high: Percentile used as the upper bound.
 
     Returns:
-        Matriz normalizada de tipo ``float32``.
+        Normalized array of type ``float32``.
     """
     flat = data[np.isfinite(data) & (data != 0)]
     if flat.size == 0:
@@ -73,17 +73,17 @@ def normalize_percentile(data, p_low=1.0, p_high=99.5):
 
 
 def subtract_row_background(data):
-    """Resta a cada fila su mediana válida para eliminar el fondo por longitud de onda.
+    """Subtract each row's valid median to remove the wavelength-dependent background.
 
-    Los ceros y valores no finitos se excluyen del cálculo de la mediana. Las
-    filas sin valores válidos usan una mediana de cero y la salida conserva la
-    forma de entrada con tipo ``float32``.
+    Zeros and non-finite values are excluded from the median calculation. Rows
+    without valid values use a median of zero, and the output preserves the
+    input shape with type ``float32``.
 
     Args:
-        data: Matriz de flujo organizada por filas espectrales.
+        data: Flux array organized by spectral rows.
 
     Returns:
-        Matriz con el fondo estimado por fila sustraído.
+        Array with the estimated row background subtracted.
     """
     valid = (data != 0) & np.isfinite(data)
     masked = np.where(valid, data, np.nan)
@@ -93,19 +93,19 @@ def subtract_row_background(data):
 
 
 def row_wise_normalize(data, p_low=1.0, p_high=99.5):
-    """Normaliza cada fila independientemente al intervalo ``[0, 1]``.
+    """Normalize each row independently to the ``[0, 1]`` interval.
 
-    Para cada fila calcula sus propios percentiles inferior y superior,
-    ignorando ceros y valores no finitos. Los píxeles inválidos se convierten
-    en cero y los valores válidos se recortan al intervalo de salida.
+    For each row, calculate its own lower and upper percentiles while ignoring
+    zeros and non-finite values. Invalid pixels become zero, and valid values
+    are clipped to the output interval.
 
     Args:
-        data: Matriz de flujo organizada por filas espectrales.
-        p_low: Percentil inferior aplicado a cada fila.
-        p_high: Percentil superior aplicado a cada fila.
+        data: Flux array organized by spectral rows.
+        p_low: Lower percentile applied to each row.
+        p_high: Upper percentile applied to each row.
 
     Returns:
-        Matriz normalizada por fila de tipo ``float32``.
+        Row-normalized array of type ``float32``.
     """
     valid = (data != 0) & np.isfinite(data)
     masked = np.where(valid, data, np.nan)
@@ -118,18 +118,18 @@ def row_wise_normalize(data, p_low=1.0, p_high=99.5):
 
 
 def arcsinh_stretch(data_01, scale=10.0):
-    """Aplica un estiramiento ``arcsinh`` a datos previamente normalizados.
+    """Apply an ``arcsinh`` stretch to previously normalized data.
 
-    El estiramiento realza los valores débiles sin saturar tan rápidamente como
-    una transformación lineal. El parámetro de escala se fuerza a ser positivo
-    y la salida se limita al intervalo ``[0, 1]``.
+    The stretch enhances faint values without saturating as quickly as a
+    linear transformation. The scale parameter is forced to be positive, and
+    the output is clipped to the ``[0, 1]`` interval.
 
     Args:
-        data_01: Datos, normalmente en el intervalo ``[0, 1]``.
-        scale: Intensidad del estiramiento no lineal.
+        data_01: Data, typically in the ``[0, 1]`` interval.
+        scale: Intensity of the nonlinear stretch.
 
     Returns:
-        Matriz transformada de tipo ``float32``.
+        Transformed array of type ``float32``.
     """
     s = max(float(scale), 1e-3)
     out = np.arcsinh(data_01 * s) / np.arcsinh(s)
@@ -141,25 +141,25 @@ def arcsinh_stretch(data_01, scale=10.0):
 # --------------------------------------------------------------------------- #
 
 def wavelength_colormap(wave_um, wave_min=None, wave_max=None):
-    """Convierte longitudes de onda en colores RGB mediante interpolación.
+    """Convert wavelengths to RGB colors by interpolation.
 
-    Normaliza las longitudes de onda al rango indicado y las interpola entre
-    anclas de color que van de violeta a rojo. Si el rango no se proporciona,
-    lo estima usando los percentiles 1 y 99 de los valores finitos plausibles
-    entre 0.1 y 50 micrómetros.
+    Normalize wavelengths to the specified range and interpolate them between
+    color anchors ranging from violet to red. If the range is not provided,
+    estimate it using the 1st and 99th percentiles of plausible finite values
+    between 0.1 and 50 micrometers.
 
     Args:
-        wave_um: Matriz de longitudes de onda expresadas en micrómetros.
-        wave_min: Límite inferior opcional del rango cromático.
-        wave_max: Límite superior opcional del rango cromático.
+        wave_um: Array of wavelengths expressed in micrometers.
+        wave_min: Optional lower bound of the color range.
+        wave_max: Optional upper bound of the color range.
 
     Returns:
-        Matriz con una dimensión final de tamaño 3 que contiene canales RGB
-        en el intervalo ``[0, 1]``.
+        Array with a final dimension of size 3 containing RGB channels
+        in the ``[0, 1]`` interval.
 
     Raises:
-        RuntimeError: Si no se puede inferir un rango a partir de valores
-            válidos de longitud de onda.
+        RuntimeError: If a range cannot be inferred from valid wavelength
+            values.
     """
     if wave_min is None or wave_max is None:
         valid = wave_um[np.isfinite(wave_um) & (wave_um > 0.1) & (wave_um < 50.0)]
@@ -180,25 +180,24 @@ def wavelength_colormap(wave_um, wave_min=None, wave_max=None):
 
 
 # --------------------------------------------------------------------------- #
-# Fill masked pixels (opcional, cosmético)
+# Fill masked pixels (optional, cosmetic)
 # --------------------------------------------------------------------------- #
 
 def fill_masked_pixels(data, size=5):
     """
-    Reemplaza píxeles con flujo cero por la mediana de su vecindario.
+    Replace zero-flux pixels with the median of their neighborhood.
 
-    La operación está pensada únicamente como corrección cosmética para
-    ocultar regiones enmascaradas por FLAGS que, de otro modo, dominarían la
-    visualización como círculos negros. Los píxeles distintos de cero se
-    conservan sin cambios.
+    This operation is intended solely as a cosmetic correction to hide regions
+    masked by FLAGS that would otherwise dominate the visualization as black
+    circles. Nonzero pixels are preserved unchanged.
 
     Args:
-        data: Matriz de flujo que puede contener píxeles enmascarados a cero.
-        size: Tamaño de la ventana usada por el filtro de mediana.
+        data: Flux array that may contain pixels masked to zero.
+        size: Size of the window used by the median filter.
 
     Returns:
-        Matriz con los ceros reemplazados, de tipo ``float32`` cuando se aplica
-        el filtrado; si no hay ceros, devuelve la entrada sin modificar.
+        Array with zeros replaced, of type ``float32`` when filtering is
+        applied; if there are no zeros, return the input unchanged.
     """
     zero_mask = (data == 0)
     if not zero_mask.any():
@@ -208,7 +207,7 @@ def fill_masked_pixels(data, size=5):
 
 
 # --------------------------------------------------------------------------- #
-# Pipeline principal
+# Main pipeline
 # --------------------------------------------------------------------------- #
 
 def spectral_paint(
@@ -224,35 +223,34 @@ def spectral_paint(
     fill_masked: bool = True,
 ) -> Image.Image:
     """
-    Genera una imagen RGB coloreando cada píxel según su longitud de onda.
+    Generate an RGB image coloring each pixel according to its wavelength.
 
-    Obtiene el flujo limpio y el mapa de longitudes de onda desde el HDUList,
-    opcionalmente rellena píxeles enmascarados, calcula el brillo mediante
-    normalización global o por fila, aplica un estiramiento ``arcsinh`` y
-    mezcla el brillo con el color espectral. Finalmente invierte verticalmente
-    la imagen para adaptarla a la orientación de visualización y devuelve un
-    objeto de imagen PIL.
+    Obtain the clean flux and wavelength map from the HDUList, optionally fill
+    masked pixels, calculate brightness using global or row-wise normalization,
+    apply an ``arcsinh`` stretch, and blend brightness with spectral color.
+    Finally, flip the image vertically to match the display orientation and
+    return a PIL image object.
 
     Args:
-        hdul: Archivo FITS abierto con los datos de imagen y calibración.
-        stretch_scale: Escala del estiramiento ``arcsinh`` del brillo.
-        p_low: Percentil inferior para la normalización.
-        p_high: Percentil superior para la normalización.
-        downsample: Factor usado al obtener el mapa de longitudes de onda.
-        wave_min: Límite inferior opcional del rango espectral mostrado.
-        wave_max: Límite superior opcional del rango espectral mostrado.
-        subtract_zodi: Indica si se sustrae la contribución zodiacal.
-        mode: ``"per_row"`` para normalización por fila o ``"global"`` para
-            normalización sobre toda la imagen.
-        fill_masked: Indica si se rellenan cosméticamente los píxeles FLAGS.
+        hdul: Open FITS file with image and calibration data.
+        stretch_scale: Scale of the brightness ``arcsinh`` stretch.
+        p_low: Lower percentile for normalization.
+        p_high: Upper percentile for normalization.
+        downsample: Factor used when obtaining the wavelength map.
+        wave_min: Optional lower bound of the displayed spectral range.
+        wave_max: Optional upper bound of the displayed spectral range.
+        subtract_zodi: Whether to subtract the zodiacal contribution.
+        mode: ``"per_row"`` for row-wise normalization or ``"global"`` for
+            normalization over the entire image.
+        fill_masked: Whether to cosmetically fill FLAGS pixels.
 
     Returns:
-        Imagen PIL en modo RGB.
+        PIL image in RGB mode.
 
     Raises:
-        RuntimeError: Si las dimensiones del mapa de longitudes de onda y de
-            la imagen limpia no coinciden.
-        ValueError: Si ``mode`` no es ``"per_row"`` ni ``"global"``.
+        RuntimeError: If the dimensions of the wavelength map and clean image
+            do not match.
+        ValueError: If ``mode`` is neither ``"per_row"`` nor ``"global"``.
     """
     logger.info("spectral_paint mode=%s fill_masked=%s", mode, fill_masked)
 
@@ -276,7 +274,7 @@ def spectral_paint(
         raise ValueError(f"Unknown mode: {mode!r}. Use 'per_row' or 'global'.")
 
     brightness = arcsinh_stretch(brightness, scale=stretch_scale)
-    # Inferir rango λ del detector si no se especificó (consistencia entre épocas)
+    # Infer detector λ range if not specified (consistency across epochs)
     if wave_min is None or wave_max is None:
         det = int(hdul["IMAGE"].header.get("DETECTOR", 0))
         if det in DETECTOR_WAVELENGTH_RANGES:
@@ -291,15 +289,15 @@ def spectral_paint(
 
 
 def to_webp_bytes(img: Image.Image, quality: int = 85, method: int = 6) -> bytes:
-    """Serializa una imagen PIL al formato WEBP en memoria.
+    """Serialize a PIL image to WEBP format in memory.
 
     Args:
-        img: Imagen PIL que se desea codificar.
-        quality: Calidad de compresión WEBP, según las opciones de PIL.
-        method: Nivel de esfuerzo del codificador WEBP.
+        img: PIL image to encode.
+        quality: WEBP compression quality, according to PIL options.
+        method: WEBP encoder effort level.
 
     Returns:
-        Bytes que contienen la imagen codificada en WEBP.
+        Bytes containing the encoded WEBP image.
     """
     buf = io.BytesIO()
     img.save(buf, format="WEBP", quality=quality, method=method)
