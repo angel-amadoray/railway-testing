@@ -1,19 +1,19 @@
 """
-Carga y procesamiento de FITS de SPHEREx (Level 2).
+SPHEREx FITS loading and processing (Level 2).
 
-Un Spectral Image de SPHEREx es un MEF con extensiones:
+A SPHEREx Spectral Image is an MEF with extensions:
     PRIMARY, IMAGE, FLAGS, VARIANCE, ZODI, PSF, WCS-WAVE
 
-La información espectral no está en un eje del cubo, sino en la extensión
-BinTable WCS-WAVE, referenciada por el header de IMAGE con sufijo 'W':
+Spectral information is not stored on a cube axis, but in the
+WCS-WAVE BinTable extension, referenced by the IMAGE header with suffix 'W':
     CTYPE1W = 'WAVE-TAB'
-    PS1_0W  = 'WCS-WAVE'      -> nombre de la extensión tabla
-    PS1_2W  = 'X'             -> columna independiente para λ (varía con X)
-    PV1_3W  = 1               -> interpolación lineal
+    PS1_0W  = 'WCS-WAVE'      -> table extension name
+    PS1_2W  = 'X'             -> independent column for λ (varies with X)
+    PV1_3W  = 1               -> linear interpolation
 
-Referencias:
-- FITS WCS Paper III (Greisen et al. 2006), sección Wave-Tab
-- Tutorial IRSA: caltech-ipac.github.io/irsa-tutorials/spherex-intro/
+References:
+- FITS WCS Paper III (Greisen et al. 2006), Wave-Tab section
+- IRSA tutorial: caltech-ipac.github.io/irsa-tutorials/spherex-intro/
 """
 
 from __future__ import annotations
@@ -35,11 +35,11 @@ FILENAME_PATTERN = re.compile(
     r"_spx_l2b-v(?P<version>\d+)-(?P<processing_date>\d{4}-\d{3})\.fits$"
 )
 
-# Validación defensiva para evitar path traversal en sector_id/epoch
+# Defensive validation to prevent path traversal in sector_id/epoch
 _ID_RE = re.compile(r"^[a-z0-9_\-]+$")
 
-# Bits de FLAGS considerados "no confiables" según SPHEREx Explanatory Supplement.
-# Otros bits son informativos (ej: pixel corregido, fuera de rango pero válido).
+# FLAGS bits considered "unreliable" according to the SPHEREx Explanatory Supplement.
+# Other bits are informational (e.g., corrected pixel, out of range but valid).
 BAD_BITS = (
     (1 << 0)   # bad data / no signal
     | (1 << 1)   # saturated
@@ -58,7 +58,7 @@ BAD_BITS = (
 RA_KEYS = ("RA_TARG", "RA_OBJ", "RA_CEN", "CRVAL1", "OBJ_RA")
 DEC_KEYS = ("DEC_TARG", "DEC_OBJ", "DEC_CEN", "CRVAL2", "OBJ_DEC")
 
-# Rangos espectrales por detector (μm). Fijos por diseño de SPHEREx.
+# Spectral ranges by detector (μm). Fixed by SPHEREx design.
 DETECTOR_WAVELENGTH_RANGES = {
     1: (0.75, 1.09),
     2: (1.10, 1.62),
@@ -70,20 +70,20 @@ DETECTOR_WAVELENGTH_RANGES = {
 
 
 # --------------------------------------------------------------------------- #
-# Helpers de HDUList
+# HDUList helpers
 # --------------------------------------------------------------------------- #
 
 def open_mef(path: str | Path) -> fits.HDUList:
-    """Abre un archivo MEF de SPHEREx usando acceso de memoria diferido.
+    """Open a SPHEREx MEF file using deferred memory access.
 
     Args:
-        path: Ruta del archivo FITS que se desea abrir.
+        path: Path to the FITS file to open.
 
     Returns:
-        ``HDUList`` abierto con ``memmap=True``; el llamador debe cerrarlo.
+        ``HDUList`` opened with ``memmap=True``; the caller must close it.
 
     Raises:
-        FileNotFoundError: Si la ruta no corresponde a un archivo existente.
+        FileNotFoundError: If the path does not point to an existing file.
     """
     path = Path(path)
     if not path.is_file():
@@ -92,17 +92,17 @@ def open_mef(path: str | Path) -> fits.HDUList:
 
 
 def _get_ext(hdul: fits.HDUList, name: str) -> fits.hdu.base.ExtensionHDU:
-    """Obtiene una extensión FITS por nombre y valida su existencia.
+    """Get a FITS extension by name and validate that it exists.
 
     Args:
-        hdul: Archivo FITS abierto.
-        name: Nombre de la extensión solicitada.
+        hdul: Open FITS file.
+        name: Name of the requested extension.
 
     Returns:
-        La extensión cuyo nombre coincide con ``name``.
+        The extension whose name matches ``name``.
 
     Raises:
-        KeyError: Si no existe; el mensaje incluye las extensiones disponibles.
+        KeyError: If it does not exist; the message includes available extensions.
     """
     try:
         return hdul[name]
@@ -113,9 +113,9 @@ def _get_ext(hdul: fits.HDUList, name: str) -> fits.hdu.base.ExtensionHDU:
         )
 
 def _validate_id(name: str, kind: str) -> str:
-    """Valida un identificador de ruta para prevenir traversal y nombres inválidos.
+    """Validate a path identifier to prevent traversal and invalid names.
 
-    Solo acepta letras minúsculas, dígitos, guiones bajos y guiones.
+    Accept only lowercase letters, digits, underscores, and hyphens.
     """
     if not _ID_RE.match(name or ""):
         raise ValueError(
@@ -126,31 +126,30 @@ def _validate_id(name: str, kind: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# WCS: espacial y espectral
+# WCS: spatial and spectral
 # --------------------------------------------------------------------------- #
 
 def get_spatial_wcs(hdul: fits.HDUList) -> WCS:
-    """Construye el WCS espacial RA/Dec a partir del header de ``IMAGE``.
+    """Build the spatial RA/Dec WCS from the ``IMAGE`` header.
 
-    El WCS conserva las distorsiones SIP definidas en el archivo y se usa para
-    convertir entre coordenadas celestes y píxeles del detector.
+    The WCS preserves the SIP distortions defined in the file and is used to
+    convert between sky coordinates and detector pixels.
     """
     return WCS(_get_ext(hdul, "IMAGE").header)
 
 
 def get_spectral_wcs(hdul: fits.HDUList) -> WCS:
     """
-    Construye el WCS espectral de longitud de onda usando ``key='W'``.
+    Build the wavelength spectral WCS using ``key='W'``.
 
-    Elimina primero las claves SIP, porque pertenecen al WCS espacial y
-    Astropy podría interpretarlas incorrectamente como parte del WCS espectral.
+    First remove SIP keys because they belong to the spatial WCS and Astropy
+    could incorrectly interpret them as part of the spectral WCS.
 
     Args:
-        hdul: Archivo FITS abierto que contiene ``IMAGE`` y ``WCS-WAVE``.
+        hdul: Open FITS file containing ``IMAGE`` and ``WCS-WAVE``.
 
     Returns:
-        WCS capaz de convertir coordenadas de píxel a longitud de onda y ancho
-        de banda.
+        WCS capable of converting pixel coordinates to wavelength and bandwidth.
     """
     header = _strip_sip_keys(_get_ext(hdul, "IMAGE").header)
     w = WCS(header, fobj=hdul, key="W")
@@ -159,14 +158,13 @@ def get_spectral_wcs(hdul: fits.HDUList) -> WCS:
 
 
 def detector_for_wavelength(wavelength_um: float) -> int | None:
-    """Identifica el detector cuyo rango contiene una longitud de onda.
+    """Identify the detector whose range contains a wavelength.
 
     Args:
-        wavelength_um: Longitud de onda en micrómetros.
+        wavelength_um: Wavelength in micrometers.
 
     Returns:
-        Número de detector entre 1 y 6, o ``None`` si está fuera de todos los
-        rangos conocidos.
+        Detector number from 1 to 6, or ``None`` if outside all known ranges.
     """
     for det, (lo, hi) in DETECTOR_WAVELENGTH_RANGES.items():
         if lo <= wavelength_um <= hi:
@@ -175,23 +173,23 @@ def detector_for_wavelength(wavelength_um: float) -> int | None:
 
 
 # --------------------------------------------------------------------------- #
-# Mapa de λ (2D)
+# λ map (2D)
 # --------------------------------------------------------------------------- #
 
 def _quantity_to_array(q, target_unit=u.um) -> np.ndarray:
     """
-    Convierte un valor de Astropy a un ``ndarray`` ``float32`` con una unidad.
+    Convert an Astropy value to a unit-bearing ``float32`` ``ndarray``.
 
-    Si el objeto tiene método ``to``, se convierte a ``target_unit``; si tiene
-    atributo ``value``, se extrae el valor numérico. Los objetos sin unidades
-    se interpretan como si ya estuvieran expresados en la unidad objetivo.
+    If the object has a ``to`` method, convert it to ``target_unit``; if it has
+    a ``value`` attribute, extract the numeric value. Unitless objects are
+    treated as already expressed in the target unit.
 
     Args:
-        q: Quantity, valor escalar o arreglo convertible a NumPy.
-        target_unit: Unidad de salida, por defecto micrómetros.
+        q: Quantity, scalar, or array convertible to NumPy.
+        target_unit: Output unit, micrometers by default.
 
     Returns:
-        Arreglo NumPy de tipo ``float32``.
+        NumPy array of type ``float32``.
     """
     if hasattr(q, "to"):
         q = q.to(target_unit)
@@ -202,22 +200,22 @@ def _quantity_to_array(q, target_unit=u.um) -> np.ndarray:
 
 def get_wavelength_map(hdul: fits.HDUList, downsample: int = 4) -> np.ndarray:
     """
-    Genera un mapa 2D de longitud de onda en micrómetros.
+    Generate a 2D wavelength map in micrometers.
 
-    Evalúa el WCS espectral en una cuadrícula reducida y reinterpola el mapa al
-    tamaño completo mediante interpolación bilineal. Esto aprovecha que, en
-    SPHEREx, la longitud de onda cambia principalmente con la posición del LVF.
+    Evaluate the spectral WCS on a reduced grid and interpolate the map to full
+    size using bilinear interpolation. This leverages the fact that in SPHEREx,
+    wavelength changes primarily with LVF position.
 
     Args:
-        hdul: Archivo FITS abierto con extensión ``IMAGE`` y WCS espectral.
-        downsample: Paso de muestreo; 1 conserva resolución completa.
+        hdul: Open FITS file with ``IMAGE`` and spectral WCS.
+        downsample: Sampling step; 1 preserves full resolution.
 
     Returns:
-        Matriz ``float32`` de forma ``(alto, ancho)`` con λ en micrómetros.
+        ``float32`` array of shape ``(height, width)`` with λ in micrometers.
 
     Raises:
-        ValueError: Si ``IMAGE`` no contiene datos.
-        RuntimeError: Si no se puede evaluar el WCS espectral.
+        ValueError: If ``IMAGE`` contains no data.
+        RuntimeError: If the spectral WCS cannot be evaluated.
     """
     image = _get_ext(hdul, "IMAGE").data
     if image is None:
@@ -246,7 +244,7 @@ def get_wavelength_map(hdul: fits.HDUList, downsample: int = 4) -> np.ndarray:
     wave_full = zoom(wave_low, zoom=ds, order=1)
     wave_full = wave_full[:ny, :nx]
     if wave_full.shape != (ny, nx):
-        # Redimensionar defensivamente si zoom no dio dimensiones exactas
+        # Resize defensively if zoom did not produce exact dimensions
         padded = np.zeros((ny, nx), dtype=np.float32)
         padded[: wave_full.shape[0], : wave_full.shape[1]] = wave_full
         wave_full = padded
@@ -254,27 +252,27 @@ def get_wavelength_map(hdul: fits.HDUList, downsample: int = 4) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
-# Imagen limpia (IMAGE - ZODI, con FLAGS enmascarados)
+# Clean image (IMAGE - ZODI, with FLAGS masked)
 # --------------------------------------------------------------------------- #
 
 def get_clean_image(hdul: fits.HDUList, subtract_zodi: bool = True, bad_bits: int = BAD_BITS) -> np.ndarray:
     """
-    Obtiene la imagen científica limpia y enmascara píxeles no confiables.
+    Obtain the clean science image and mask unreliable pixels.
 
-    Parte de ``IMAGE``, sustrae ``ZODI`` opcionalmente y usa ``FLAGS`` para
-    convertir a cero los píxeles cuyos bits intersectan ``bad_bits``. Los bits
-    no incluidos se conservan. NaN e infinitos también se convierten a cero.
+    Start with ``IMAGE``, optionally subtract ``ZODI``, and use ``FLAGS`` to
+    set pixels whose bits intersect ``bad_bits`` to zero. Bits not included are
+    preserved. NaNs and infinities are also converted to zero.
 
     Args:
-        hdul: Archivo FITS abierto.
-        subtract_zodi: Indica si debe sustraerse la extensión zodiacal.
-        bad_bits: Máscara de bits considerados inválidos.
+        hdul: Open FITS file.
+        subtract_zodi: Whether to subtract the zodiacal extension.
+        bad_bits: Mask of bits considered invalid.
 
     Returns:
-        Imagen ``float32`` de forma ``(alto, ancho)``.
+        ``float32`` image of shape ``(height, width)``.
 
     Raises:
-        ValueError: Si la extensión ``IMAGE`` no contiene datos.
+        ValueError: If the ``IMAGE`` extension contains no data.
     """
     image_hdu = _get_ext(hdul, "IMAGE")
     if image_hdu.data is None:
@@ -302,7 +300,7 @@ def get_clean_image(hdul: fits.HDUList, subtract_zodi: bool = True, bad_bits: in
 
 
 # --------------------------------------------------------------------------- #
-# Extracción de un "corte" a una λ dada
+# Extract a "slice" at a given λ
 # --------------------------------------------------------------------------- #
 
 def extract_2d_at_wavelength(
@@ -312,23 +310,23 @@ def extract_2d_at_wavelength(
     downsample: int = 4,
 ) -> np.ndarray:
     """
-    Extrae una imagen 2D correspondiente a una banda espectral objetivo.
+    Extract a 2D image corresponding to a target spectral band.
 
-    Conserva el flujo de píxeles cuya longitud de onda está dentro de
-    ``target_um ± tol_um`` y pone el resto a cero. En SPHEREx esto suele
-    producir una franja asociada al patrón LVF.
+    Keep the flux of pixels whose wavelength is within ``target_um ± tol_um``
+    and set the rest to zero. In SPHEREx this typically produces a strip
+    associated with the LVF pattern.
 
     Args:
-        hdul: Archivo FITS abierto.
-        target_um: Longitud de onda central en micrómetros.
-        tol_um: Tolerancia espectral alrededor de la longitud objetivo.
-        downsample: Paso usado al construir el mapa espectral.
+        hdul: Open FITS file.
+        target_um: Central wavelength in micrometers.
+        tol_um: Spectral tolerance around the target wavelength.
+        downsample: Step used to build the spectral map.
 
     Returns:
-        Imagen ``float32`` con la misma forma que ``IMAGE``.
+        ``float32`` image with the same shape as ``IMAGE``.
 
     Raises:
-        RuntimeError: Si el mapa espectral y la imagen tienen formas distintas.
+        RuntimeError: If the spectral map and image have different shapes.
     """
     clean = get_clean_image(hdul)
     wave_map = get_wavelength_map(hdul, downsample=downsample)
@@ -359,23 +357,23 @@ def wavelength_range(
     p_high: float = 99.0,
 ) -> tuple[float, float]:
     """
-    Calcula el rango robusto de longitudes de onda cubierto por la imagen.
+    Calculate the robust wavelength range covered by the image.
 
-    Descarta valores no finitos y fuera del intervalo físico 0.1–50 μm, y usa
-    percentiles para evitar que extrapolaciones del WCS en las esquinas
-    distorsionen el resultado.
+    Discard non-finite values and values outside the physical 0.1–50 μm range,
+    and use percentiles to prevent WCS extrapolations at the corners from
+    distorting the result.
 
     Args:
-        hdul: Archivo FITS abierto.
-        downsample: Paso usado al obtener el mapa espectral.
-        p_low: Percentil inferior del rango.
-        p_high: Percentil superior del rango.
+        hdul: Open FITS file.
+        downsample: Step used to obtain the spectral map.
+        p_low: Lower percentile of the range.
+        p_high: Upper percentile of the range.
 
     Returns:
-        Tupla ``(mínimo, máximo)`` en micrómetros.
+        ``(minimum, maximum)`` tuple in micrometers.
 
     Raises:
-        RuntimeError: Si no se encuentran longitudes de onda válidas.
+        RuntimeError: If no valid wavelengths are found.
     """
     wave = get_wavelength_map(hdul, downsample=downsample)
     valid = wave[np.isfinite(wave) & (wave > 0.1) & (wave < 50.0)]
@@ -391,21 +389,20 @@ def wavelength_profiles(
     hdul: fits.HDUList, n_samples: int = 20
 ) -> dict:
     """
-    Muestrea perfiles espectrales a lo largo de los ejes X e Y.
+    Sample spectral profiles along the X and Y axes.
 
-    Calcula longitud de onda y ancho de banda en una fila central recorriendo X
-    y en una columna central recorriendo Y. El resultado sirve para diagnosticar
-    la geometría LVF del detector.
+    Calculate wavelength and bandwidth along a central row across X and a
+    central column across Y. The result helps diagnose detector LVF geometry.
 
     Args:
-        hdul: Archivo FITS abierto.
-        n_samples: Número de posiciones que se muestrean en cada eje.
+        hdul: Open FITS file.
+        n_samples: Number of positions sampled on each axis.
 
     Returns:
-        Diccionario con la forma de la imagen y listas ``along_x`` y ``along_y``.
+        Dictionary with the image shape and ``along_x`` and ``along_y`` lists.
 
     Raises:
-        ValueError: Si ``IMAGE`` no contiene datos.
+        ValueError: If ``IMAGE`` contains no data.
     """
     image = _get_ext(hdul, "IMAGE").data
     if image is None:
@@ -439,19 +436,19 @@ def wavelength_profiles(
 
 
 # --------------------------------------------------------------------------- #
-# Descubrimiento de archivos en disco
+# File discovery on disk
 # --------------------------------------------------------------------------- #
 
 def parse_filename_metadata(filename: str) -> dict:
-    """Extrae metadatos estructurados del nombre estándar de un FITS SPHEREx.
+    """Extract structured metadata from a standard SPHEREx FITS filename.
 
     Args:
-        filename: Nombre de archivo, no necesariamente una ruta completa.
+        filename: Filename, not necessarily a full path.
 
     Returns:
-        Diccionario con periodo de planificación, ``obs_id``, visita, detector,
-        versión y fecha de procesamiento. Devuelve un diccionario vacío si el
-        nombre no cumple el patrón esperado.
+        Dictionary with planning period, ``obs_id``, visit, detector, version,
+        and processing date. Return an empty dictionary if the name does not
+        match the expected pattern.
     """
     m = FILENAME_PATTERN.match(filename)
     if not m:
@@ -464,21 +461,21 @@ def parse_filename_metadata(filename: str) -> dict:
 
 
 def find_sector_files(sector_id: str, epoch: str, data_dir: Path | None = None) -> list[Path]:
-    """Lista los archivos FITS locales de un sector y época.
+    """List local FITS files for a sector and epoch.
 
-    Valida ambos identificadores antes de formar la ruta. Si el directorio no
-    existe, devuelve una lista vacía en lugar de lanzar una excepción.
+    Validate both identifiers before forming the path. If the directory does
+    not exist, return an empty list instead of raising an exception.
 
     Args:
-        sector_id: Identificador del sector.
-        epoch: Identificador de la época de observación.
-        data_dir: Raíz de datos opcional; si falta, usa la configuración global.
+        sector_id: Sector identifier.
+        epoch: Observation epoch identifier.
+        data_dir: Optional data root; if omitted, use global configuration.
 
     Returns:
-        Lista ordenada de rutas ``.fits``.
+        Sorted list of ``.fits`` paths.
 
     Raises:
-        ValueError: Si algún identificador contiene caracteres no permitidos.
+        ValueError: If an identifier contains disallowed characters.
     """
     _validate_id(sector_id, "sector_id")
     _validate_id(epoch, "epoch")
@@ -501,15 +498,15 @@ def find_fits_file(
     data_dir: Path | None = None,
 ) -> Path:
     """
-    Localiza un único FITS según sector, época y detector.
+    Locate a single FITS file by sector, epoch, and detector.
 
-    Puede restringir la búsqueda por ``obs_id`` y ``visit`` para resolver
-    ambigüedades entre varios archivos compatibles.
+    Restrict the search by ``obs_id`` and ``visit`` to resolve ambiguities among
+    multiple matching files.
 
     Raises:
-        FileNotFoundError: Si no hay ningún archivo coincidente.
-        ValueError: Si hay varios candidatos sin filtros suficientes o si los
-            identificadores de ruta no son válidos.
+        FileNotFoundError: If no matching file exists.
+        ValueError: If multiple candidates remain without sufficient filters or
+            if path identifiers are invalid.
     """
     _validate_id(sector_id, "sector_id")
     _validate_id(epoch, "epoch")
@@ -552,22 +549,22 @@ def load_local_fits(
     data_dir: Path | None = None,
 ) -> fits.HDUList:
     """
-    Localiza y abre el FITS correspondiente.
+    Locate and open the corresponding FITS file.
 
-    Si ``data_dir`` se proporciona, la búsqueda es exclusivamente local. Si es
-    ``None``, usa el servicio de almacenamiento para descargar el archivo si no
-    está disponible localmente.
+    If ``data_dir`` is provided, the search is exclusively local. If it is
+    ``None``, use the storage service to download the file if it is not locally
+    available.
 
     Args:
-        sector_id: Identificador del sector.
-        epoch: Época de observación.
-        detector: Número de detector.
-        obs_id: Identificador de observación opcional.
-        visit: Número de visita opcional.
-        data_dir: Raíz local que fuerza el modo sin descarga.
+        sector_id: Sector identifier.
+        epoch: Observation epoch.
+        detector: Detector number.
+        obs_id: Optional observation identifier.
+        visit: Optional visit number.
+        data_dir: Local root that forces no-download mode.
 
     Returns:
-        ``HDUList`` abierto; el llamador debe cerrarlo.
+        Open ``HDUList``; the caller must close it.
     """
     from app.services.storage import download_fits_if_missing
 
@@ -588,14 +585,14 @@ def load_local_fits(
 
 
 # --------------------------------------------------------------------------- #
-# Info de headers (usada por el router /debug)
+# Header information (used by the /debug router)
 # --------------------------------------------------------------------------- #
 
 def _extract_coordinates(header: fits.Header) -> dict:
-    """Extrae RA y Dec usando la primera clave válida de cada lista conocida.
+    """Extract RA and Dec using the first valid key from each known list.
 
-    Los valores no numéricos se ignoran y se continúa buscando una clave
-    alternativa. El resultado conserva también el nombre de la clave utilizada.
+    Non-numeric values are ignored and the search continues with an alternative
+    key. The result also preserves the name of the key used.
     """
     ra = dec = ra_key = dec_key = None
     for k in RA_KEYS:
@@ -616,10 +613,10 @@ def _extract_coordinates(header: fits.Header) -> dict:
 
 
 def _header_to_dict(header: fits.Header) -> dict:
-    """Convierte un header FITS en un diccionario compatible con JSON.
+    """Convert a FITS header into a JSON-compatible dictionary.
 
-    Omite ``COMMENT`` y ``HISTORY``, convierte escalares NumPy a tipos nativos,
-    decodifica bytes y transforma cualquier objeto restante a texto.
+    Omit ``COMMENT`` and ``HISTORY``, convert NumPy scalars to native types,
+    decode bytes, and convert any remaining object to text.
     """
     out = {}
     for key, value in header.items():
@@ -636,27 +633,27 @@ def _header_to_dict(header: fits.Header) -> dict:
 
 
 def list_extensions(file_path: Path) -> list[str]:
-    """Lee y devuelve los nombres de todas las extensiones de un FITS.
+    """Read and return the names of all extensions in a FITS file.
 
     Args:
-        file_path: Ruta del archivo FITS.
+        file_path: FITS file path.
 
     Returns:
-        Lista de nombres en el orden en que aparecen en el archivo.
+        List of names in the order in which they appear in the file.
     """
     with fits.open(file_path, memmap=True) as hdul:
         return [hdu.name for hdu in hdul]
 
 
 def read_header_info(file_path: Path) -> dict:
-    """Recopila headers, coordenadas y extensiones de un archivo FITS.
+    """Collect headers, coordinates, and extensions from a FITS file.
 
-    Lee el header primario y, cuando existe, el de ``IMAGE``. Las coordenadas
-    se buscan primero en el primario y luego en ``IMAGE`` si son necesarias.
+    Read the primary header and, when present, the ``IMAGE`` header. Search for
+    coordinates in the primary first, then in ``IMAGE`` if necessary.
 
     Returns:
-        Diccionario con ``primary_header``, ``image_header``, ``extensions`` y
-        ``coordinates``.
+        Dictionary with ``primary_header``, ``image_header``, ``extensions``,
+        and ``coordinates``.
     """
     logger.info("Reading FITS headers: %s", file_path)
     with fits.open(file_path, memmap=True) as hdul:
@@ -682,10 +679,10 @@ def read_header_info(file_path: Path) -> dict:
 
 def _strip_sip_keys(header: fits.Header) -> fits.Header:
     """
-    Devuelve una copia sin claves SIP de distorsión espacial.
+    Return a copy without spatial-distortion SIP keys.
 
-    Elimina claves con prefijos ``A_``, ``B_``, ``AP_`` y ``BP_`` para evitar
-    que Astropy aplique la distorsión espacial al WCS espectral ``WAVE-TAB``.
+    Remove keys with prefixes ``A_``, ``B_``, ``AP_``, and ``BP_`` to prevent
+    Astropy from applying spatial distortion to the ``WAVE-TAB`` spectral WCS.
     """
     h = header.copy()
     sip_prefixes = ("A_", "B_", "AP_", "BP_")
@@ -697,19 +694,19 @@ def _strip_sip_keys(header: fits.Header) -> fits.Header:
     return h
 
 # --------------------------------------------------------------------------- #
-# Serialización WCS y conversiones pixel ↔ world
+# WCS serialization and pixel ↔ world conversions
 # --------------------------------------------------------------------------- #
 
 def serialize_wcs(hdul: fits.HDUList) -> dict:
     """
-    Serializa los parámetros principales del WCS espacial.
+    Serialize the main parameters of the spatial WCS.
 
-    El resultado contiene valores de referencia, píxeles de referencia, tipos
-    de coordenada, matriz de escala y si existe una distorsión SIP; está pensado
-    para diagnóstico o reconstrucción en un frontend.
+    The result contains reference values, reference pixels, coordinate types,
+    scale matrix, and whether SIP distortion exists; it is intended for
+    diagnostics or reconstruction in a frontend.
 
     Returns:
-        Diccionario con valores JSON-serializables del WCS de ``IMAGE``.
+        Dictionary with JSON-serializable values from the ``IMAGE`` WCS.
     """
     wcs = get_spatial_wcs(hdul)
     cd = wcs.pixel_scale_matrix.tolist()
@@ -731,18 +728,18 @@ def world_to_pixel_batch(
     dec_deg: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Convierte lotes de coordenadas RA/Dec a coordenadas de píxel.
+    Convert batches of RA/Dec coordinates to pixel coordinates.
 
-    Usa ``all_world2pix`` e incluye la distorsión SIP. Las entradas no finitas
-    y los puntos que fallen en el WCS se representan como ``NaN``.
+    Use ``all_world2pix`` and include SIP distortion. Non-finite inputs and
+    points that fail in the WCS are represented as ``NaN``.
 
     Args:
-        hdul: Archivo FITS abierto.
-        ra_deg: Arreglo de ascensiones rectas en grados.
-        dec_deg: Arreglo de declinaciones en grados.
+        hdul: Open FITS file.
+        ra_deg: Array of right ascensions in degrees.
+        dec_deg: Array of declinations in degrees.
 
     Returns:
-        Dos arreglos ``float64`` ``(x, y)`` con la misma forma que las entradas.
+        Two ``float64`` arrays ``(x, y)`` with the same shape as the inputs.
     """
     wcs = get_spatial_wcs(hdul)
     ra = np.asarray(ra_deg, dtype=np.float64)
@@ -759,7 +756,7 @@ def world_to_pixel_batch(
             x.flat[i] = xi
             y.flat[i] = yi
         except Exception:
-            # Punto fuera del WCS válido: queda NaN
+            # Point outside the valid WCS: remains NaN
             continue
 
     return x, y
@@ -771,17 +768,17 @@ def pixel_to_world(
     pixel_y: float,
 ) -> tuple[float, float]:
     """
-    Convierte una posición de píxel a RA y Dec en grados.
+    Convert a pixel position to RA and Dec in degrees.
 
-    Usa el WCS espacial completo de ``IMAGE``, incluida la distorsión SIP.
+    Use the complete spatial WCS from ``IMAGE``, including SIP distortion.
 
     Args:
-        hdul: Archivo FITS abierto.
-        pixel_x: Coordenada X del píxel.
-        pixel_y: Coordenada Y del píxel.
+        hdul: Open FITS file.
+        pixel_x: Pixel X coordinate.
+        pixel_y: Pixel Y coordinate.
 
     Returns:
-        Tupla ``(ra_deg, dec_deg)`` como valores ``float``.
+        ``(ra_deg, dec_deg)`` tuple as ``float`` values.
     """
     wcs = get_spatial_wcs(hdul)
     ra, dec = wcs.all_pix2world(pixel_x, pixel_y, 0)
@@ -789,16 +786,16 @@ def pixel_to_world(
 
 def get_variance(hdul: fits.HDUList) -> np.ndarray | None:
     """
-    Obtiene la extensión ``VARIANCE`` como una copia ``float32``.
+    Get the ``VARIANCE`` extension as a ``float32`` copy.
 
-    Los valores no finitos se convierten en ``NaN``. Si la extensión falta o no
-    contiene datos, devuelve ``None``; no aplica la máscara de ``FLAGS``.
+    Non-finite values are converted to ``NaN``. If the extension is missing or
+    contains no data, return ``None``; the ``FLAGS`` mask is not applied.
 
     Args:
-        hdul: Archivo FITS abierto.
+        hdul: Open FITS file.
 
     Returns:
-        Matriz de varianza o ``None`` cuando no está disponible.
+        Variance array or ``None`` when unavailable.
     """
     try:
         var_hdu = _get_ext(hdul, "VARIANCE")

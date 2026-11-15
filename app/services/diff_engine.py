@@ -1,14 +1,14 @@
 """
-Motor de diferencias — Fase 4 (v3, consolidada).
+Difference engine — Phase 4 (v3, consolidated).
 
-Fixes respecto a v2:
-- Background 2D rápido (submuestreo + mediana pequeña + gaussian + upsample)
-- Background se aplica DESPUÉS de reproject → residuos por fila se cancelan
-- Ruido local vía bloques (SExtractor-style), O(N)
-- Defaults = v1 (absolute + row_background + percentile 99) para no perder
-  sensibilidad; features de v2 disponibles como opt-in
-- mask_stars afecta al cálculo del umbral (no al render por defecto)
-- Nuevo: mask_stars_display para ocultar los donuts en la imagen final
+Fixes compared to v2:
+- Fast 2D background (downsampling + small median + Gaussian + upsampling)
+- Background is applied AFTER reprojection → row residuals cancel out
+- Local noise via blocks (SExtractor-style), O(N)
+- Defaults = v1 (absolute + row_background + percentile 99) to preserve
+  sensitivity; v2 features available as opt-in
+- mask_stars affects threshold calculation (not rendering by default)
+- New: mask_stars_display to hide donuts in the final image
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
-# Background 2D rápido
+# Fast 2D background
 # --------------------------------------------------------------------------- #
 
 def estimate_background_2d_fast(
@@ -44,23 +44,23 @@ def estimate_background_2d_fast(
     sigma: float = 2.0,
 ) -> np.ndarray:
     """
-    Estima el fondo suave bidimensional de una imagen de forma eficiente.
+    Efficiently estimate the smooth two-dimensional background of an image.
 
-    El algoritmo reduce primero la resolución, aplica un filtro de mediana
-    para eliminar fuentes puntuales, suaviza el resultado con un filtro
-    gaussiano y finalmente lo interpola de nuevo al tamaño original. Los
-    píxeles cero o no finitos se excluyen de la estimación y se sustituyen por
-    la mediana global únicamente durante el cálculo del fondo.
+    The algorithm first reduces the resolution, applies a median filter to
+    remove point sources, smooths the result with a Gaussian filter, and
+    finally interpolates it back to the original size. Zero or non-finite
+    pixels are excluded from the estimate and replaced with the global median
+    only during background calculation.
 
     Args:
-        data: Matriz bidimensional de datos cuya forma se conservará.
-        downsample: Paso de submuestreo usado en ambos ejes.
-        kernel: Tamaño de la ventana del filtro de mediana en la imagen reducida.
-        sigma: Desviación estándar del suavizado gaussiano.
+        data: Two-dimensional data array whose shape will be preserved.
+        downsample: Downsampling step used on both axes.
+        kernel: Median filter window size in the reduced image.
+        sigma: Standard deviation of the Gaussian smoothing.
 
     Returns:
-        Matriz ``float32`` con el fondo estimado y el mismo tamaño que ``data``.
-        Si no hay datos válidos, devuelve una matriz de ceros.
+        ``float32`` array with the estimated background and the same size as
+        ``data``. If there is no valid data, return an array of zeros.
     """
     h, w = data.shape
     valid = np.isfinite(data) & (data != 0)
@@ -88,20 +88,20 @@ def estimate_background_2d_fast(
 
 
 def flatten_2d(data: np.ndarray, downsample: int = 8) -> np.ndarray:
-    """Elimina el fondo 2D estimado de una imagen.
+    """Remove the estimated 2D background from an image.
 
     Args:
-        data: Matriz bidimensional de señal.
-        downsample: Factor de reducción usado al estimar el fondo.
+        data: Two-dimensional signal array.
+        downsample: Reduction factor used when estimating the background.
 
     Returns:
-        Residuo ``data - fondo`` como matriz ``float32``.
+        ``data - background`` residual as a ``float32`` array.
     """
     return (data - estimate_background_2d_fast(data, downsample=downsample)).astype(np.float32)
 
 
 # --------------------------------------------------------------------------- #
-# Alineación WCS
+# WCS alignment
 # --------------------------------------------------------------------------- #
 
 def align_to_reference(
@@ -111,19 +111,18 @@ def align_to_reference(
     shape_out: tuple[int, int],
     order: str = "bilinear",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Alinea una imagen mediante reproyección al sistema WCS de referencia.
+    """Align an image by reprojecting it to the reference WCS system.
 
     Args:
-        src_data: Imagen origen que se desea reproyectar.
-        src_wcs: WCS asociado a ``src_data``.
-        ref_wcs: WCS de la cuadrícula de salida.
-        shape_out: Alto y ancho de la imagen resultante.
-        order: Interpolación usada por ``reproject_interp``.
+        src_data: Source image to reproject.
+        src_wcs: WCS associated with ``src_data``.
+        ref_wcs: WCS of the output grid.
+        shape_out: Height and width of the resulting image.
+        order: Interpolation used by ``reproject_interp``.
 
     Returns:
-        Tupla ``(aligned, footprint)`` con la imagen alineada y la fracción de
-        cobertura de cada píxel. Los valores no finitos de la imagen se ponen
-        a cero.
+        ``(aligned, footprint)`` tuple with the aligned image and the coverage
+        fraction for each pixel. Non-finite image values are set to zero.
     """
     aligned, footprint = reproject_interp(
         (src_data, src_wcs),
@@ -139,30 +138,29 @@ def align_to_reference(
 
 
 # --------------------------------------------------------------------------- #
-# Ruido local rápido (bloques estilo SExtractor)
+# Fast local noise (SExtractor-style blocks)
 # --------------------------------------------------------------------------- #
 
 def estimate_local_noise_blocks(diff: np.ndarray, block_size: int = 64) -> np.ndarray:
     """
-    Estima el ruido local de una diferencia mediante bloques y MAD.
+    Estimate local noise in a difference using blocks and MAD.
 
-    Divide la imagen en bloques, calcula en cada uno la desviación absoluta
-    mediana (MAD) y la convierte a una estimación de sigma mediante el factor
-    1.4826. Después interpola el mapa de bloques al tamaño original y garantiza
-    un valor mínimo positivo. Para imágenes menores que un bloque usa una
-    estimación global.
+    Divide the image into blocks, calculate the median absolute deviation (MAD)
+    in each, and convert it to a sigma estimate using the 1.4826 factor. Then
+    interpolate the block map to the original size and ensure a positive
+    minimum value. For images smaller than one block, use a global estimate.
 
     Args:
-        diff: Matriz de diferencias.
-        block_size: Tamaño de cada bloque cuadrado.
+        diff: Difference array.
+        block_size: Size of each square block.
 
     Returns:
-        Mapa ``float32`` de ruido local con la misma forma que ``diff``.
+        ``float32`` local-noise map with the same shape as ``diff``.
     """
     h, w = diff.shape
     ny, nx = h // block_size, w // block_size
     if ny == 0 or nx == 0:
-        # Imagen más pequeña que un bloque: usar estimación global
+        # Image smaller than one block: use global estimate
         valid = diff[np.isfinite(diff) & (diff != 0)]
         sigma = 1.4826 * float(np.median(np.abs(valid - np.median(valid)))) if valid.size else 1.0
         return np.full_like(diff, max(sigma, 1e-6), dtype=np.float32)
@@ -180,8 +178,7 @@ def estimate_local_noise_blocks(diff: np.ndarray, block_size: int = 64) -> np.nd
 
     if np.all(np.isnan(noise_map)):
         return np.full_like(diff, 1e-6, dtype=np.float32)
-
-    # Rellenar bloques NaN con la mediana global
+    # Fill NaN blocks with the global median
     fill_val = float(np.nanmedian(noise_map))
     noise_map = np.where(np.isnan(noise_map), fill_val, noise_map)
 
@@ -196,7 +193,7 @@ def estimate_local_noise_blocks(diff: np.ndarray, block_size: int = 64) -> np.nd
 
 
 # --------------------------------------------------------------------------- #
-# Máscara de estrellas brillantes
+# Bright-star mask
 # --------------------------------------------------------------------------- #
 
 def bright_star_mask(
@@ -205,21 +202,21 @@ def bright_star_mask(
     percentile: float = 99.9,
     dilate_iter: int = 2,
 ) -> np.ndarray:
-    """Detecta y dilata una máscara de las fuentes más brillantes.
+    """Detect and dilate a mask of the brightest sources.
 
-    Combina el valor absoluto de ambas imágenes, obtiene un umbral basado en
-    percentil e incluye los píxeles que lo superan. La dilatación opcional
-    permite cubrir el entorno inmediato de cada estrella.
+    Combine the absolute values of both images, obtain a percentile-based
+    threshold, and include pixels exceeding it. Optional dilation covers the
+    immediate surroundings of each star.
 
     Args:
-        t1: Imagen de referencia ya corregida.
-        t2_aligned: Segunda imagen alineada con ``t1``.
-        percentile: Percentil usado para definir el brillo extremo.
-        dilate_iter: Número de iteraciones de dilatación binaria.
+        t1: Already-corrected reference image.
+        t2_aligned: Second image aligned with ``t1``.
+        percentile: Percentile used to define extreme brightness.
+        dilate_iter: Number of binary dilation iterations.
 
     Returns:
-        Máscara booleana con la forma de las imágenes. Si no hay señal positiva,
-        devuelve una máscara completamente falsa.
+        Boolean mask with the shape of the images. If there is no positive
+        signal, return an all-False mask.
     """
     valid = (t1 != 0) | (t2_aligned != 0)
     combined = np.maximum(np.abs(t1), np.abs(t2_aligned))
@@ -236,7 +233,7 @@ def bright_star_mask(
 
 
 # --------------------------------------------------------------------------- #
-# Diferencia y threshold
+# Difference and threshold
 # --------------------------------------------------------------------------- #
 
 def compute_signed_difference(
@@ -247,22 +244,22 @@ def compute_signed_difference(
     ratio: bool = False,
     eps: float = 1e-6,
 ) -> np.ndarray:
-    """Calcula la diferencia entre dos imágenes y descarta baja cobertura.
+    """Calculate the difference between two images and discard low coverage.
 
-    Con ``ratio=False`` calcula ``t2_aligned - t1``. Con ``ratio=True`` calcula
-    el cambio relativo ``(t2_aligned + eps) / (t1 + eps) - 1``. Solo conserva
-    píxeles cuyo ``footprint`` alcanza ``min_coverage``.
+    With ``ratio=False``, calculate ``t2_aligned - t1``. With ``ratio=True``,
+    calculate the relative change ``(t2_aligned + eps) / (t1 + eps) - 1``.
+    Keep only pixels whose ``footprint`` reaches ``min_coverage``.
 
     Args:
-        t1: Imagen de referencia.
-        t2_aligned: Segunda imagen en la misma cuadrícula.
-        footprint: Cobertura de reproyección por píxel.
-        min_coverage: Cobertura mínima aceptada.
-        ratio: Selecciona diferencia relativa en vez de absoluta.
-        eps: Constante para evitar divisiones por cero.
+        t1: Reference image.
+        t2_aligned: Second image on the same grid.
+        footprint: Per-pixel reprojection coverage.
+        min_coverage: Minimum accepted coverage.
+        ratio: Select relative rather than absolute difference.
+        eps: Constant to avoid division by zero.
 
     Returns:
-        Diferencia ``float32`` con píxeles fuera de cobertura establecidos a cero.
+        ``float32`` difference with out-of-coverage pixels set to zero.
     """
     if ratio:
         diff = (t2_aligned + eps) / (t1 + eps) - 1.0
@@ -280,26 +277,26 @@ def compute_threshold(
     percentile: float = 99.0,
     sigma_k: float = 5.0,
 ) -> float:
-    """Calcula el umbral usado para separar cambios significativos del ruido.
+    """Calculate the threshold used to separate significant changes from noise.
 
-    El método ``absolute`` devuelve ``value``; ``percentile`` usa el percentil
-    del valor absoluto de la señal; y ``sigma`` usa la mediana más ``sigma_k``
-    veces una sigma robusta derivada de MAD. ``exclude_mask`` permite omitir
-    regiones, como estrellas brillantes, del cálculo.
+    The ``absolute`` method returns ``value``; ``percentile`` uses the percentile
+    of the signal's absolute value; and ``sigma`` uses the median plus ``sigma_k``
+    times a robust sigma derived from MAD. ``exclude_mask`` omits regions such
+    as bright stars from the calculation.
 
     Args:
-        signal: Señal absoluta o normalizada por ruido.
-        exclude_mask: Máscara opcional de píxeles que no deben participar.
-        method: ``absolute``, ``percentile`` o ``sigma``.
-        value: Umbral directo requerido por ``absolute``.
-        percentile: Percentil usado por ``percentile``.
-        sigma_k: Multiplicador de sigma usado por ``sigma``.
+        signal: Absolute or noise-normalized signal.
+        exclude_mask: Optional mask of pixels to exclude.
+        method: ``absolute``, ``percentile``, or ``sigma``.
+        value: Direct threshold required by ``absolute``.
+        percentile: Percentile used by ``percentile``.
+        sigma_k: Sigma multiplier used by ``sigma``.
 
     Returns:
-        Umbral numérico como ``float``; devuelve cero si no hay datos válidos.
+        Numeric threshold as ``float``; return zero if there is no valid data.
 
     Raises:
-        ValueError: Si falta ``value`` para ``absolute`` o el método no existe.
+        ValueError: If ``value`` is missing for ``absolute`` or the method is unknown.
     """
     if method == "absolute":
         if value is None:
@@ -326,17 +323,17 @@ def compute_threshold(
 
 
 def apply_threshold(diff: np.ndarray, threshold: float) -> np.ndarray:
-    """Aplica un umbral a una matriz de diferencias.
+    """Apply a threshold to a difference array.
 
-    Conserva el signo y el valor original de los píxeles cuyo valor absoluto
-    es mayor o igual que ``threshold``; el resto se reemplaza por cero.
+    Preserve the sign and original value of pixels whose absolute value is
+    greater than or equal to ``threshold``; replace the rest with zero.
 
     Args:
-        diff: Matriz de diferencias.
-        threshold: Magnitud mínima que debe superar una diferencia.
+        diff: Difference array.
+        threshold: Minimum magnitude a difference must exceed.
 
     Returns:
-        Matriz ``float32`` con las diferencias no significativas eliminadas.
+        ``float32`` array with insignificant differences removed.
     """
     return np.where(np.abs(diff) >= threshold, diff, 0.0).astype(np.float32)
 
@@ -350,23 +347,23 @@ def render_heatmap(
     style: str = "signed",
     p_high: float = 99.9,
 ) -> Image.Image:
-    """Renderiza una diferencia en una imagen RGB orientada para visualización.
+    """Render a difference as an RGB image oriented for display.
 
-    El estilo ``signed`` representa cambios positivos en rojo y negativos en
-    verde. El estilo ``absolute`` representa la magnitud con una escala de
-    intensidad. La escala se obtiene del percentil superior de los valores no
-    nulos y la imagen se invierte verticalmente antes de crear el objeto PIL.
+    The ``signed`` style represents positive changes in red and negative changes
+    in green. The ``absolute`` style represents magnitude using an intensity
+    scale. The scale is obtained from the upper percentile of nonzero values,
+    and the image is flipped vertically before creating the PIL object.
 
     Args:
-        diff_masked: Diferencia con los píxeles descartados puestos a cero.
-        style: ``signed`` o ``absolute``.
-        p_high: Percentil usado para calcular la escala máxima.
+        diff_masked: Difference with discarded pixels set to zero.
+        style: ``signed`` or ``absolute``.
+        p_high: Percentile used to calculate the maximum scale.
 
     Returns:
-        Imagen PIL en modo RGB. Si no hay señal válida, devuelve una imagen negra.
+        PIL image in RGB mode. If there is no valid signal, return a black image.
 
     Raises:
-        ValueError: Si ``style`` no es ``signed`` ni ``absolute``.
+        ValueError: If ``style`` is neither ``signed`` nor ``absolute``.
     """
     flat = diff_masked[np.isfinite(diff_masked) & (diff_masked != 0)]
     if flat.size == 0:
@@ -394,22 +391,22 @@ def render_heatmap(
 
 
 # --------------------------------------------------------------------------- #
-# Pipeline completo (v3)
+# Complete pipeline (v3)
 # --------------------------------------------------------------------------- #
 
 def compute_difference(
     hdul_t1: fits.HDUList,
     hdul_t2: fits.HDUList,
     # Background
-    background_mode: str = "row",       # "row" (v1, rápido) | "2d" (v3, limpio) | "none"
+    background_mode: str = "row",       # "row" (v1, fast) | "2d" (v3, clean) | "none"
     background_downsample: int = 8,
-    # Diferencia
+    # Difference
     ratio: bool = False,
-    # Máscaras
+    # Masks
     mask_stars_for_threshold: bool = True,
     mask_stars_for_display: bool = False,
     star_percentile: float = 99.9,
-    # Normalización
+    # Normalization
     normalize: str = "absolute",        # "absolute" (v1) | "snr" (v2)
     noise_block_size: int = 64,
     # Threshold
@@ -417,44 +414,43 @@ def compute_difference(
     threshold_value: float | None = None,
     threshold_percentile: float = 99.0,
     sigma_k: float = 5.0,
-    # Resto
+    # Miscellaneous
     min_coverage: float = 0.5,
     style: str = "signed",
     downsample: int = 1,
 ) -> dict:
-    """Compara dos observaciones y genera una visualización de sus diferencias.
+    """Compare two observations and generate a visualization of their differences.
 
-    Limpia ambas imágenes, reproyecta la segunda sobre la primera, corrige el
-    fondo seleccionado, calcula la diferencia, estima opcionalmente el ruido
-    local, excluye estrellas del cálculo del umbral y renderiza los cambios que
-    superan dicho umbral. También devuelve métricas de cobertura, conteos y
-    configuración empleada.
+    Clean both images, reproject the second onto the first, correct the selected
+    background, calculate the difference, optionally estimate local noise,
+    exclude stars from threshold calculation, and render changes exceeding the
+    threshold. Also return coverage metrics, counts, and configuration used.
 
     Args:
-        hdul_t1: FITS de la observación de referencia.
-        hdul_t2: FITS de la observación que se alineará contra la referencia.
-        background_mode: ``row``, ``2d`` o ``none``.
-        background_downsample: Submuestreo para el fondo 2D.
-        ratio: Usa diferencias relativas cuando es ``True``.
-        mask_stars_for_threshold: Excluye estrellas del cálculo del umbral.
-        mask_stars_for_display: Oculta estrellas también en la imagen final.
-        star_percentile: Percentil para detectar estrellas brillantes.
-        normalize: ``absolute`` usa la diferencia directa; ``snr`` la divide
-            entre el ruido local.
-        noise_block_size: Tamaño de bloque para estimar ruido local.
-        threshold_method: Método de cálculo del umbral.
-        threshold_value: Valor explícito para el método ``absolute``.
-        threshold_percentile: Percentil para el método ``percentile``.
-        sigma_k: Factor sigma para el método ``sigma``.
-        min_coverage: Cobertura mínima exigida tras reproyección.
-        style: Estilo de renderizado del mapa de calor.
-        downsample: Reducción final aplicada antes del renderizado.
+        hdul_t1: FITS of the reference observation.
+        hdul_t2: FITS of the observation to align with the reference.
+        background_mode: ``row``, ``2d``, or ``none``.
+        background_downsample: Downsampling for the 2D background.
+        ratio: Use relative differences when ``True``.
+        mask_stars_for_threshold: Exclude stars from threshold calculation.
+        mask_stars_for_display: Also hide stars in the final image.
+        star_percentile: Percentile for detecting bright stars.
+        normalize: ``absolute`` uses direct difference; ``snr`` divides it
+            by local noise.
+        noise_block_size: Block size for estimating local noise.
+        threshold_method: Threshold calculation method.
+        threshold_value: Explicit value for the ``absolute`` method.
+        threshold_percentile: Percentile for the ``percentile`` method.
+        sigma_k: Sigma factor for the ``sigma`` method.
+        min_coverage: Minimum coverage required after reprojection.
+        style: Heatmap rendering style.
+        downsample: Final reduction applied before rendering.
 
     Returns:
-        Diccionario con ``image``, umbral, conteos y metadatos del análisis.
+        Dictionary with ``image``, threshold, counts, and analysis metadata.
 
     Raises:
-        ValueError: Si la cobertura es insuficiente o se usa una opción inválida.
+        ValueError: If coverage is insufficient or an invalid option is used.
     """
     logger.info(
         "diff_engine v3: bg=%s normalize=%s ratio=%s mask_thr=%s mask_disp=%s",
@@ -467,7 +463,7 @@ def compute_difference(
     wcs_t1 = get_spatial_wcs(hdul_t1)
     wcs_t2 = get_spatial_wcs(hdul_t2)
 
-    # 1) Reproyectar PRIMERO (en bruto, sin background)
+    # 1) Reproject FIRST (raw, without background)
     logger.info("  reprojecting T2 → T1 (%.0fx%.0f)", *clean_t1.shape)
     aligned_t2, footprint = align_to_reference(
         clean_t2, wcs_t2, wcs_t1, shape_out=clean_t1.shape
@@ -481,7 +477,7 @@ def compute_difference(
             "¿Estás comparando la misma región del cielo?"
         )
 
-    # 2) Background AHORA, en el mismo grid de píxeles
+    # 2) Background NOW, on the same pixel grid
     if background_mode == "none":
         flat_t1, flat_t2 = clean_t1, aligned_t2
     elif background_mode == "row":
@@ -495,18 +491,18 @@ def compute_difference(
     else:
         raise ValueError(f"background_mode must be row|2d|none, got {background_mode!r}")
 
-    # 3) Diferencia
+    # 3) Difference
     signed_diff = compute_signed_difference(
         flat_t1, flat_t2, footprint, min_coverage=min_coverage, ratio=ratio,
     )
 
-    # 4) Máscara de estrellas
+    # 4) Star mask
     star_mask = None
     if mask_stars_for_threshold or mask_stars_for_display:
         star_mask = bright_star_mask(flat_t1, flat_t2, percentile=star_percentile)
         logger.info("  star mask: %.2f%% pixels", float(star_mask.mean()) * 100)
 
-    # 5) Señal para el umbral
+    # 5) Signal for the threshold
     if normalize == "snr":
         noise = estimate_local_noise_blocks(signed_diff, block_size=noise_block_size)
         signal = (signed_diff / noise).astype(np.float32)
@@ -526,11 +522,11 @@ def compute_difference(
     )
     logger.info("  threshold = %.5g (normalize=%s)", threshold, normalize)
 
-    # 7) Aplicar threshold en el espacio de `signal`, mostrar en diff real
+    # 7) Apply threshold in `signal` space, display the actual difference
     keep = np.abs(signal) >= threshold
     display = np.where(keep, signed_diff, 0.0).astype(np.float32)
 
-    # 8) Opcional: ocultar estrellas residuales del render
+    # 8) Optional: hide residual stars from the render
     if mask_stars_for_display and star_mask is not None:
         display = np.where(star_mask, 0.0, display).astype(np.float32)
 
@@ -565,15 +561,15 @@ def compute_difference(
 
 
 def to_webp_bytes(img: Image.Image, quality: int = 85, method: int = 6) -> bytes:
-    """Codifica una imagen PIL como WEBP sin crear un archivo temporal.
+    """Encode a PIL image as WEBP without creating a temporary file.
 
     Args:
-        img: Imagen que se desea serializar.
-        quality: Calidad de compresión solicitada.
-        method: Nivel de esfuerzo del codificador WEBP.
+        img: Image to serialize.
+        quality: Requested compression quality.
+        method: WEBP encoder effort level.
 
     Returns:
-        Secuencia de bytes con la imagen WEBP codificada.
+        Byte sequence containing the encoded WEBP image.
     """
     buf = io.BytesIO()
     img.save(buf, format="WEBP", quality=quality, method=method)
