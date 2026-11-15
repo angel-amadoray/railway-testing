@@ -2,8 +2,8 @@
 
   {
     "id": "orion_nebula",
-    "name": "Nebulosa de Orión (M42)",
-    "description": "Región de formación estelar masiva.",
+    "name": "Orion Nebula (M42)",
+    "description": "Massive star-forming region.",
     "ra": 84.43,
     "dec": -6.91,
     "size_deg": 1.0,
@@ -12,8 +12,8 @@
   },
   {
     "id": "galactic_center",
-    "name": "Centro Galáctico",
-    "description": "Región más densa de la Vía Láctea en Sagitario.",
+    "name": "Galactic Center",
+    "description": "Densest region of the Milky Way in Sagittarius.",
     "ra": 265.6177,
     "dec": -29.1511,
     "size_deg": 1.0,
@@ -22,8 +22,8 @@
   },
   {
     "id": "rho_ophiuchi",
-    "name": "Complejo Rho Ophiuchi",
-    "description": "Región de formación estelar cercana (140 pc) con nubes moleculares y abundantes fuentes infrarrojas.",
+    "name": "Rho Ophiuchi Complex",
+    "description": "Nearby star-forming region (140 pc) with molecular clouds and abundant infrared sources.",
     "ra": 247.02,
     "dec": -24.54,
     "size_deg": 1.0,
